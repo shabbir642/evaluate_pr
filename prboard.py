@@ -126,6 +126,15 @@ DEFAULT_CONFIG = {
     # rather than CHECKS_FAILED. Acting on one is a separate decision: leave
     # this false and advisory PRs are shown but never auto-approved.
     "act_on_advisory_checks": False,
+    # Checks you never let slide, even when GitHub says they aren't required.
+    # A failure matching one of these always blocks. Globs, matched on the
+    # check's name (e.g. "security-scan", "*e2e*").
+    "blocking_check_patterns": [],
+    # Checks you consider known noise. A failure matching one of these is
+    # advisory even when GitHub hasn't said the merge is unblocked — the one
+    # way to relax the strict fallback, and only for checks you name.
+    # blocking_check_patterns wins over this.
+    "advisory_check_patterns": [],
 }
 
 # No timeout means urllib can block forever on a half-open socket, which in
@@ -497,7 +506,8 @@ def _latest_reviews(reviews):
 def _check_state(gh, owner, repo, sha, required_contexts):
     """
     Summarize checks for a commit. Returns (state, detail) where state is one
-    of 'passing' | 'pending' | 'failing' | 'none' | 'error'.
+    of 'passing' | 'pending' | 'failing' | 'none' | 'error', plus the list of
+    failing check names so the caller can decide which ones actually matter.
     'none' means the commit genuinely has no checks; 'error' means we could not
     find out. Neither is ever treated as green by the caller.
     Considers GitHub Actions check-runs AND legacy commit statuses.
@@ -543,8 +553,8 @@ def _check_state(gh, owner, repo, sha, required_contexts):
         # An endpoint we could not read might have been hiding a failing check.
         err = runs_err or statuses_err
         if err is not None:
-            return "error", f"could not read checks ({err})"
-        return "none", "no checks reported"
+            return "error", f"could not read checks ({err})", []
+        return "none", "no checks reported", []
 
     if required_contexts:
         relevant = {n: s for n, s in results.items() if n in required_contexts}
@@ -557,13 +567,13 @@ def _check_state(gh, owner, repo, sha, required_contexts):
         scope = results
 
     vals = list(scope.values())
-    if any(v == "failing" for v in vals):
-        n = sum(1 for v in vals if v == "failing")
-        return "failing", f"{n} check(s) failing"
+    failing = sorted(n for n, v in scope.items() if v == "failing" and n)
+    if failing:
+        return "failing", f"{_names(failing)} failing", failing
     if any(v == "pending" for v in vals):
         n = sum(1 for v in vals if v == "pending")
-        return "pending", f"{n} check(s) pending"
-    return "passing", f"{len(vals)} check(s) passing"
+        return "pending", f"{n} check(s) pending", []
+    return "passing", f"{len(vals)} check(s) passing", []
 
 
 def _rules_for_branch(gh, owner, repo, base):
@@ -592,6 +602,30 @@ def _rules_for_branch(gh, owner, repo, base):
                     contexts.add(chk["context"])
     # An empty list is a real answer: this branch has no rulesets on it.
     return approvals, (contexts or None), True
+
+
+def _names(items, limit=3):
+    """'a, b (+2 more)' — keep reasons readable when a dozen checks are red."""
+    items = list(items)
+    head = ", ".join(items[:limit])
+    return head + (f" (+{len(items) - limit} more)" if len(items) > limit else "")
+
+
+def split_failing_checks(failing, cfg):
+    """
+    Split failing check names into (blocking, advisory) using config globs.
+
+    Anything not named by either list is left for the mergeable_state logic to
+    judge, so this only ever overrides GitHub in the direction the user asked
+    for. blocking wins over advisory when a name matches both.
+    """
+    blocking_pats = cfg.get("blocking_check_patterns") or []
+    advisory_pats = cfg.get("advisory_check_patterns") or []
+    blocking = [n for n in failing if any(fnmatch(n, p) for p in blocking_pats)]
+    advisory = [n for n in failing
+                if n not in blocking
+                and any(fnmatch(n, p) for p in advisory_pats)]
+    return blocking, advisory
 
 
 def _branch_protection(gh, owner, repo, base):
@@ -850,7 +884,8 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         req_approvals = cfg.get("default_required_approvals", 1)
     out["approvals"] = f"{approvals}/{req_approvals}"
 
-    check_state, check_detail = _check_state(gh, owner, repo, head_sha, req_contexts)
+    check_state, check_detail, failing_checks = _check_state(
+        gh, owner, repo, head_sha, req_contexts)
     if check_state == "error":
         gate_errors.append(check_detail)
 
@@ -909,8 +944,19 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     # see which contexts are required when protection is unreadable.
     advisory = None
     if check_state == "failing":
+        forced_blocking, named_advisory = split_failing_checks(failing_checks, cfg)
+        if forced_blocking:
+            # You listed these as never-ignore, so GitHub's opinion doesn't matter.
+            out["verdict"] = "CHECKS_FAILED"
+            reasons.append(f"{_names(forced_blocking)} failing "
+                           "(listed in blocking_check_patterns)")
+            return out
         if mergeable_state == "unstable":
-            advisory = check_detail
+            advisory = _names(failing_checks)
+        elif named_advisory and len(named_advisory) == len(failing_checks):
+            # Every red check is one you've named as noise.
+            advisory = _names(named_advisory)
+            reasons.append("all failing checks matched advisory_check_patterns")
         else:
             # blocked, clean, or unknown with a red check: stay strict.
             out["verdict"] = "CHECKS_FAILED"
@@ -920,7 +966,7 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
             return out
     elif mergeable_state == "unstable":
         # Required contexts are known and green, but something else is red.
-        advisory = "non-required check(s) not passing"
+        advisory = "non-required check(s)"
     if advisory:
         out["advisory"] = advisory
 
@@ -931,7 +977,7 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         if check_state in ("pending", "none"):
             reasons.append(check_detail)
         if advisory:
-            reasons.append(f"{advisory} (not required — does not block merge)")
+            reasons.append(f"{advisory} failing (not required — does not block)")
         return out
 
     # 'none' means CI has not reported yet — on a fresh push that is the normal
@@ -950,7 +996,8 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     # either — surface it as its own verdict so the call is yours to make.
     if advisory:
         out["verdict"] = "CHECKS_ADVISORY"
-        reasons.append(f"{advisory} — not required on '{base}', merge not blocked")
+        reasons.append(f"{advisory} failing — not required on '{base}', "
+                       "merge not blocked")
         reasons.append(f"{approvals}/{req_approvals} approvals, state={mergeable_state}")
         if req_contexts:
             reasons.append("required checks on '%s' (%s) are green"
@@ -1156,19 +1203,29 @@ def render_table(results):
         return
     order = {v: i for i, v in enumerate(VERDICT_ORDER)}
     results.sort(key=lambda r: (order.get(r["verdict"], 99), r["repo"], r["number"]))
+    # Only draw the ADVISORY column when something is actually in it —
+    # otherwise it's a column of blanks on every ordinary run.
+    show_advisory = any(r.get("advisory") for r in results)
     rows = []
     for r in results:
         pr_id = f"{r['repo']}#{r['number']}"
         title = (r["title"][:46] + "…") if len(r["title"]) > 47 else r["title"]
-        rows.append([
+        row = [
             VERDICT_LABEL.get(r["verdict"], r["verdict"]),
             pr_id,
             r.get("base", ""),
             r.get("approvals", ""),
             r.get("checks", ""),
-            title,
-        ])
-    headers = ["VERDICT", "PR", "BASE", "APPR", "CHECKS", "TITLE"]
+        ]
+        if show_advisory:
+            adv = r.get("advisory", "")
+            row.append((adv[:24] + "…") if len(adv) > 25 else adv)
+        row.append(title)
+        rows.append(row)
+    headers = ["VERDICT", "PR", "BASE", "APPR", "CHECKS"]
+    if show_advisory:
+        headers.append("RED (ADVISORY)")
+    headers.append("TITLE")
     widths = [max(len(headers[i]), max((len(row[i]) for row in rows), default=0))
               for i in range(len(headers))]
     line = "  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))

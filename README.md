@@ -193,9 +193,26 @@ that rather than its own reading of the check list:
 | `dirty` | merge conflict | `CONFLICT` |
 | `clean` / `has_hooks` | green | proceeds |
 
-`CHECKS_ADVISORY` means GitHub would let the merge through. It is shown on the
-board with the failing check named, but the action engine **ignores it** unless
-you set `act_on_advisory_checks: true`.
+`CHECKS_ADVISORY` means GitHub would let the merge through. The board names the
+failing check in a `RED (ADVISORY)` column — which only appears when there is
+something to put in it — and the action engine **ignores it** unless you set
+`act_on_advisory_checks: true`.
+
+Two globs, matched on the check's name, override that per check:
+
+```json
+"blocking_check_patterns": ["security-scan", "*e2e*"],
+"advisory_check_patterns": ["guardrails", "*lint*"]
+```
+
+- `blocking_check_patterns` — never let this slide. Blocks even when GitHub
+  says the check isn't required, and beats `act_on_advisory_checks`.
+- `advisory_check_patterns` — known noise. Treated as advisory even when GitHub
+  hasn't said the merge is unblocked. It only applies when **every** failing
+  check matches, so one unexpected red check still blocks.
+
+`blocking` wins over `advisory`. With neither set, the strict fallback is
+unchanged.
 
 Required checks are read from classic branch protection (needs admin) and, 
 failing that, from repository rulesets (`/rules/branches/{branch}`, which needs

@@ -5,7 +5,7 @@ GitHub applies branch protection when it computes mergeable_state, so that —
 not our reading of the raw check list — decides whether a failure blocks.
 Fixtures mirror real PRs observed on vmockinc/career-service-ui.
 """
-import os, sys
+import contextlib, io, os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _loader import pb
 
@@ -182,6 +182,100 @@ for _ in range(3):
 chk("protection lookups are cached per branch", gh.prot_calls <= 2)
 pb._branch_protection(gh, "o", "r", "other-branch")
 chk("a different branch is looked up fresh", gh.prot_calls > 2)
+
+# --- phase 3: say WHICH check is red --------------------------------------
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING)
+ev = pb.evaluate_pr(gh, cfg(), "o", "r", 1, ME)
+chk("advisory names the failing check", ev["advisory"] == "guardrails")
+chk("reason names the failing check",
+    any(r.startswith("guardrails failing") for r in ev["reasons"]))
+
+MANY = {"check_runs": [{"name": n, "status": "completed", "conclusion": "failure"}
+                       for n in ("a", "b", "c", "d", "e")]}
+ev = pb.evaluate_pr(FakeGH(mkpr("unstable"), checkruns=MANY), cfg(), "o", "r", 1, ME)
+chk("many failures are summarised, not listed in full",
+    "(+2 more)" in ev["advisory"] and ev["advisory"].startswith("a, b, c"))
+chk("_names keeps short lists intact", pb._names(["x", "y"]) == "x, y")
+chk("_names truncates long ones", pb._names(["a", "b", "c", "d"]) == "a, b, c (+1 more)")
+
+
+# --- phase 4: blocking_check_patterns overrides GitHub --------------------
+c = cfg(blocking_check_patterns=["guardrails"])
+ev = pb.evaluate_pr(FakeGH(mkpr("unstable"), checkruns=FAILING), c, "o", "r", 1, ME)
+chk("blocking pattern blocks even when unstable", ev["verdict"] == "CHECKS_FAILED")
+chk("blocking pattern says why",
+    any("blocking_check_patterns" in r for r in ev["reasons"]))
+
+c = cfg(blocking_check_patterns=["*guard*"])
+chk("blocking pattern accepts globs",
+    V(FakeGH(mkpr("unstable"), checkruns=FAILING), c) == "CHECKS_FAILED")
+
+c = cfg(blocking_check_patterns=["security-scan"])
+chk("a non-matching blocking pattern changes nothing",
+    V(FakeGH(mkpr("unstable"), checkruns=FAILING), c) == "CHECKS_ADVISORY")
+
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING)
+ev = pb.apply_pr(gh, cfg(blocking_check_patterns=["guardrails"],
+                        act_on_advisory_checks=True,
+                        enable_auto_merge=True), "o", "r", 1, ME)
+chk("blocking pattern beats act_on_advisory_checks",
+    gh.posts == [] and gh.puts == [])
+
+
+# --- phase 4: advisory_check_patterns relaxes the strict fallback ---------
+c = cfg(advisory_check_patterns=["guardrails"])
+ev = pb.evaluate_pr(FakeGH(mkpr("clean"), checkruns=FAILING), c, "o", "r", 1, ME)
+chk("advisory pattern relaxes a non-unstable failure",
+    ev["verdict"] == "CHECKS_ADVISORY")
+chk("advisory pattern says why",
+    any("advisory_check_patterns" in r for r in ev["reasons"]))
+
+MIXED = {"check_runs": [
+    {"name": "guardrails", "status": "completed", "conclusion": "failure"},
+    {"name": "unit-tests", "status": "completed", "conclusion": "failure"}]}
+c = cfg(advisory_check_patterns=["guardrails"])
+chk("a partial match does NOT relax (unit-tests still blocks)",
+    V(FakeGH(mkpr("clean"), checkruns=MIXED), c) == "CHECKS_FAILED")
+chk("all-matching does relax",
+    V(FakeGH(mkpr("clean"), checkruns=MIXED),
+      cfg(advisory_check_patterns=["guardrails", "unit-tests"])) == "CHECKS_ADVISORY")
+
+chk("no patterns configured -> strict fallback unchanged",
+    V(FakeGH(mkpr("clean"), checkruns=FAILING)) == "CHECKS_FAILED")
+
+
+# --- split_failing_checks ---------------------------------------------------
+b, a = pb.split_failing_checks(["x", "y"], cfg(blocking_check_patterns=["x"],
+                                               advisory_check_patterns=["y"]))
+chk("split sorts each name to its list", b == ["x"] and a == ["y"])
+b, a = pb.split_failing_checks(["x"], cfg(blocking_check_patterns=["x"],
+                                          advisory_check_patterns=["x"]))
+chk("blocking wins when a name matches both", b == ["x"] and a == [])
+b, a = pb.split_failing_checks(["x"], cfg())
+chk("unnamed checks go in neither list", b == [] and a == [])
+
+
+# --- the board only grows a column when it has something to show ----------
+def render(results):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        pb.render_table(results)
+    return buf.getvalue()
+
+base_row = {"repo": "o/r", "number": 1, "title": "t", "base": "uat",
+            "approvals": "0/1", "checks": "passing", "reasons": [],
+            "url": "u", "verdict": "NEEDS_YOUR_APPROVAL"}
+out = render([dict(base_row)])
+chk("no advisory anywhere -> no extra column", "RED (ADVISORY)" not in out)
+
+adv = dict(base_row, verdict="CHECKS_ADVISORY", checks="failing",
+           advisory="guardrails")
+out = render([adv])
+chk("advisory present -> column appears", "RED (ADVISORY)" in out)
+chk("column shows the check name", "guardrails" in out)
+
+out = render([dict(base_row), dict(adv, number=2)])
+chk("mixed rows still render one table", out.count("RED (ADVISORY)") == 1)
 
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")
