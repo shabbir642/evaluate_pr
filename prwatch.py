@@ -11,7 +11,10 @@ never a red flag).
 Runtime deps:  pip install slack_sdk
 Env required:
     SLACK_APP_TOKEN   xapp-...   (Socket Mode app-level token, scope connections:write)
-    SLACK_BOT_TOKEN   xoxb-...   (bot token; bot must be in the channel)
+    SLACK_BOT_TOKEN   xoxb-...   (bot token; bot must be invited to the channel.
+                       Scopes: chat:write plus groups:history for a private
+                       channel or channels:history for a public one; subscribe
+                       to message.groups / message.channels to match.)
     GITHUB_TOKEN      (gh auth token, or a PAT with repo + pull_requests:write)
     PRBOARD_SLACK_USER   your Slack user id (e.g. U02LS4K29KQ) — the mention it reacts to
 Env optional:

@@ -278,12 +278,18 @@ Mac is awake and you're logged in; `launchd` keeps it alive and restarts it.
 1. api.slack.com/apps → **Create New App** → From scratch → your VMock workspace.
 2. **Socket Mode** → enable it. Generate an **App-Level Token** with scope
    `connections:write` → copy the `xapp-...` token.
-3. **OAuth & Permissions** → add **Bot Token Scopes**: `channels:history` (or
-   `groups:history` if the channel is private) and `chat:write` (for the DM
-   it sends you). Install to workspace → copy the `xoxb-...` bot token.
+3. **OAuth & Permissions** → add **Bot Token Scopes**: `groups:history` and
+   `chat:write` (for the DM it sends you). Install to workspace → copy the
+   `xoxb-...` bot token.
 4. **Event Subscriptions** → enable → subscribe to the bot event
-   `message.channels` (or `message.groups` for a private channel).
+   `message.groups`.
 5. **Invite the bot to the channel**: in #cmc-deployments-team, `/invite @YourApp`.
+
+> `#cmc-deployments-team` (C043639SVEY) is a **private** channel, which is why
+> the scope is `groups:history` and the event is `message.groups` — the
+> `channels:*` equivalents are for public channels and would leave the bot
+> connected but never triggered. For a public channel use `channels:history`
+> and `message.channels` instead.
 
 ### Who can trigger it
 

@@ -12,3 +12,6 @@ audit.log
 
 # os
 .DS_Store
+
+# local venv for prwatch's slack_sdk
+.venv/
