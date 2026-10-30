@@ -1344,7 +1344,11 @@ def main(argv=None):
     ap.add_argument("--apply", action="store_true",
                     help="ACT: approve/merge PRs that pass every gate (writes to GitHub)")
     ap.add_argument("--wait", action="store_true",
-                    help="with --apply: wait for pending checks to finish, then act")
+                    help="with --apply: wait for pending checks to finish, then "
+                         "act. Implied when you name PRs with --pr.")
+    ap.add_argument("--no-wait", action="store_true",
+                    help="don't wait for pending checks, even with --pr; a PR "
+                         "mid-CI is simply left alone")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --apply: print what it WOULD do, change nothing")
     ap.add_argument("--act-on-advisory", action="store_true",
@@ -1443,6 +1447,19 @@ def main(argv=None):
             print("No candidate PRs found. (Try --slack, --repo owner/repo, or --pr URL.)")
         return 0
 
+    # Naming a PR with --pr is a deliberate choice of that one PR, so waiting
+    # for its checks is almost always what you meant — without it a run that
+    # lands mid-CI silently abandons the PR and nothing comes back for it.
+    # Feed- and --repo-driven runs stay opt-in: they can be dozens of PRs, and
+    # the wait loop is sequential and costs ~6 API calls per poll.
+    wait = args.wait
+    if args.apply and args.pr and not args.repo and not args.no_wait:
+        wait = True
+    if wait and not args.wait:
+        print(f"note: waiting up to {cfg.get('wait_timeout_seconds', 1800)}s for "
+              "checks on the PR(s) you named (--no-wait to skip).",
+              file=sys.stderr)
+
     results = []
     todo = sorted(candidates)
     # Each PR costs ~6 sequential GitHub calls, so this is the slow part and
@@ -1451,13 +1468,17 @@ def main(argv=None):
         for i, (owner, repo, number) in enumerate(todo, 1):
             where = f"[{i}/{len(todo)}] {owner}/{repo}#{number}"
             if args.apply:
-                if args.wait:
+                if wait:
                     progress.update(f"{where} — waiting for checks…")
                     ev = wait_until_actionable(gh, cfg, owner, repo, number, me)
                     if ev["verdict"] in actionable_verdicts(cfg):
                         progress.update(f"{where} — applying…")
                         ev = apply_pr(gh, cfg, owner, repo, number, me,
                                       dry_run=args.dry_run)
+                    else:
+                        # apply_pr never ran, so say why rather than a bare
+                        # "no action" — it already reads as "it did nothing".
+                        ev.setdefault("action", f"no action ({ev['verdict']})")
                 else:
                     progress.update(f"{where} — applying…")
                     ev = apply_pr(gh, cfg, owner, repo, number, me,

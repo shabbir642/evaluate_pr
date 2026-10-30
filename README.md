@@ -141,6 +141,17 @@ It never applies to an explicit `--pr`: if you name a PR, you get it.
 ./prboard.py --apply --dry-run --pr vmockinc/career-service-ui#833
 ```
 
+Naming a PR this way **implies `--wait`**: if its checks are still running it
+polls until they finish (up to `wait_timeout_seconds`, default 30 min) and then
+acts. Without that, a run landing mid-CI prints `no action (CHECKS_PENDING)`
+and nothing ever comes back for that PR. Pass `--no-wait` to get the old
+one-shot behaviour.
+
+Feed- and `--repo`-driven runs do **not** imply it — those can be dozens of
+PRs, and the wait loop is sequential and costs ~6 API calls per poll, so one
+stuck PR would block everything behind it. Use `--wait` explicitly there, or
+let `prwatch` handle it: it waits on every PR, one thread each, in parallel.
+
 It accepts a full URL (including `/files`, `#anchor` and `?query` suffixes), a
 bare `github.com/owner/repo/pull/123`, another host for GitHub Enterprise, or
 the `owner/repo#123` shorthand. The Slack scanner stays strict about full URLs
