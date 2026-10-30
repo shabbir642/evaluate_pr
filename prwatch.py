@@ -48,10 +48,24 @@ except ImportError:
     sys.exit("prwatch needs slack_sdk:  pip install slack_sdk")
 
 
+def env_flag(name, default=False):
+    """
+    Read a boolean env var the way people expect.
+
+    bool(os.environ.get(...)) makes "0", "false" and "off" all true, so
+    PRBOARD_DRY_RUN=0 — the obvious way to turn dry-run off — would leave it
+    on and prwatch would silently never act. Unset still means `default`.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
+
+
 CFG = pb.load_config(os.environ.get("PRBOARD_CONFIG"))
 MY_SLACK_ID = os.environ.get("PRBOARD_SLACK_USER", "")
 CHANNEL = CFG.get("slack_channel", "")
-DRY_RUN = bool(os.environ.get("PRBOARD_DRY_RUN"))
+DRY_RUN = env_flag("PRBOARD_DRY_RUN")
 ALLOWED_SENDERS = {u.strip() for u in
                    os.environ.get("PRBOARD_ALLOWED_SENDERS", "").split(",")
                    if u.strip()}
@@ -163,8 +177,12 @@ def main():
         web_client=WebClient(token=os.environ["SLACK_BOT_TOKEN"]),
     )
     client.socket_mode_request_listeners.append(on_event)
-    mode = "DRY-RUN" if DRY_RUN else ("LIVE, auto-merge "
-            + ("ON" if CFG.get("enable_auto_merge") else "OFF"))
+    if DRY_RUN:
+        mode = "DRY-RUN"
+    else:
+        mode = "LIVE, auto-merge " + ("ON" if CFG.get("enable_auto_merge") else "OFF")
+        if CFG.get("act_on_advisory_checks"):
+            mode += ", acting on PRs with non-required checks RED"
     senders = ",".join(sorted(ALLOWED_SENDERS)) if ALLOWED_SENDERS else "any human"
     log(f"prwatch connecting — channel {CHANNEL}, reacting to <@{MY_SLACK_ID}> "
         f"from {senders} [{mode}]")

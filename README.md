@@ -316,8 +316,16 @@ export $(grep -v '^#' ~/.config/prboard/secrets.env | xargs) && ./prwatch.py
 ```
 
 Drop a PR link mentioning yourself in the channel and watch the log. Once the
-dry-run behaviour looks right, remove `PRBOARD_DRY_RUN` from secrets and set
-`enable_auto_merge: true` in config.
+dry-run behaviour looks right, set `PRBOARD_DRY_RUN=0` (or comment the line
+out) and set `enable_auto_merge: true` in config.
+
+The startup line says exactly what the process will do, so check it before
+walking away:
+
+```
+prwatch connecting — channel C043639SVEY, reacting to <@U02LS4K29KQ> from any human [DRY-RUN]
+prwatch connecting — channel C043639SVEY, reacting to <@U02LS4K29KQ> from any human [LIVE, auto-merge ON, acting on PRs with non-required checks RED]
+```
 
 ### Keep it running (launchd)
 

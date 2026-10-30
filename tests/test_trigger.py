@@ -130,6 +130,45 @@ chk("allowlist tolerates whitespace",
 chk("non-allowlisted sender is ignored",
     not triggers(pw, {"user": "U_STRANGER", "text": f"<@{ME_SLACK}> {LINK}"}))
 
+# --- dry-run must be unambiguous in both directions -----------------------
+# bool(os.environ.get(...)) made "0" and "false" true, so the obvious way to
+# turn dry-run off left it on and prwatch silently never acted.
+pw = load_prwatch(PRBOARD_SLACK_USER=ME_SLACK)
+for raw, want in [("1", True), ("true", True), ("yes", True), ("on", True),
+                  ("TRUE", True), (" 1 ", True),
+                  ("0", False), ("false", False), ("no", False),
+                  ("off", False), ("", False), ("  ", False)]:
+    os.environ["PRBOARD_DRY_RUN"] = raw
+    chk(f"PRBOARD_DRY_RUN={raw!r} -> {want}", pw.env_flag("PRBOARD_DRY_RUN") is want)
+os.environ.pop("PRBOARD_DRY_RUN", None)
+chk("unset defaults to off", pw.env_flag("PRBOARD_DRY_RUN") is False)
+chk("unset honours an explicit default",
+    pw.env_flag("PRBOARD_DRY_RUN", default=True) is True)
+
+# the module-level DRY_RUN must follow it
+pw = load_prwatch(PRBOARD_SLACK_USER=ME_SLACK, PRBOARD_DRY_RUN="1")
+chk("module DRY_RUN true when set", pw.DRY_RUN is True)
+pw = load_prwatch(PRBOARD_SLACK_USER=ME_SLACK, PRBOARD_DRY_RUN="0")
+chk("module DRY_RUN false for '0'", pw.DRY_RUN is False)
+pw = load_prwatch(PRBOARD_SLACK_USER=ME_SLACK)
+chk("module DRY_RUN false when unset", pw.DRY_RUN is False)
+
+# a dry run must reach prboard's engine with dry_run=True and write nothing
+pw = load_prwatch(PRBOARD_SLACK_USER=ME_SLACK, PRBOARD_DRY_RUN="1")
+seen = {}
+pw.pb = type("P", (), {
+    "GitHub": staticmethod(lambda *a, **k: type("G", (), {"login": lambda s: "me"})()),
+    "wait_until_actionable": staticmethod(
+        lambda *a, **k: {"verdict": "NEEDS_YOUR_APPROVAL", "url": "u"}),
+    "actionable_verdicts": staticmethod(lambda cfg: ("NEEDS_YOUR_APPROVAL",)),
+    "apply_pr": staticmethod(
+        lambda gh, cfg, o, r, n, me, dry_run=False: seen.update(dry_run=dry_run)
+        or {"verdict": "NEEDS_YOUR_APPROVAL", "action": "would APPROVE", "url": "u"}),
+    "VERDICT_LABEL": {},
+})()
+pw.handle_pr("o", "r", 1, None)
+chk("dry run reaches apply_pr with dry_run=True", seen.get("dry_run") is True)
+
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")
 sys.exit(0 if ok == len(res) else 1)
