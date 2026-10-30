@@ -277,6 +277,66 @@ chk("column shows the check name", "guardrails" in out)
 out = render([dict(base_row), dict(adv, number=2)])
 chk("mixed rows still render one table", out.count("RED (ADVISORY)") == 1)
 
+# --- an approved advisory PR must actually be able to merge ---------------
+# Regression: ready was computed as (verdict == "READY_TO_MERGE") alone, so
+# enabling act_on_advisory_checks AND enable_auto_merge still merged nothing.
+ADV = dict(act_on_advisory_checks=True, enable_auto_merge=True)
+
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING, reviews=[approve(ME)])
+ev = pb.evaluate_pr(gh, cfg(**ADV), "o", "r", 1, ME)
+chk("approved advisory PR reports approvals_met", ev["approvals_met"] is True)
+chk("approved advisory PR records mergeable_state",
+    ev["mergeable_state"] == "unstable")
+
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING, reviews=[approve(ME)])
+ev = pb.apply_pr(gh, cfg(**ADV), "o", "r", 1, ME)
+chk("approved advisory PR merges", len(gh.puts) == 1)
+chk("merge pins the gated sha", gh.puts and gh.puts[0]["sha"] == "abc")
+chk("it does not re-approve what you already approved", gh.posts == [])
+
+# unapproved: approve first, then merge once the count is satisfied
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING)
+ev = pb.apply_pr(gh, cfg(**ADV), "o", "r", 1, ME)
+chk("unapproved advisory PR is approved", len(gh.posts) == 1)
+
+# and every existing brake still holds
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING, reviews=[approve(ME)])
+pb.apply_pr(gh, cfg(act_on_advisory_checks=True, enable_auto_merge=False),
+            "o", "r", 1, ME)
+chk("enable_auto_merge=False still blocks the merge", gh.puts == [])
+
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING, reviews=[approve(ME)])
+pb.apply_pr(gh, cfg(enable_auto_merge=True), "o", "r", 1, ME)
+chk("act_on_advisory_checks=False still blocks the merge", gh.puts == [])
+
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING, reviews=[approve(ME)])
+pb.apply_pr(gh, cfg(blocking_check_patterns=["guardrails"], **ADV),
+            "o", "r", 1, ME)
+chk("blocking_check_patterns still blocks the merge", gh.puts == [])
+
+gh = FakeGH(mkpr("unstable", base="master"), checkruns=FAILING,
+            reviews=[approve(ME)])
+pb.apply_pr(gh, cfg(**ADV), "o", "r", 1, ME)
+chk("protected base still blocks the merge", gh.puts == [])
+
+# a state GitHub has NOT called mergeable must not merge, even when advisory
+gh = FakeGH(mkpr("blocked"), checkruns=FAILING, reviews=[approve(ME)])
+pb.apply_pr(gh, cfg(advisory_check_patterns=["guardrails"], **ADV),
+            "o", "r", 1, ME)
+chk("blocked state never merges even via advisory patterns", gh.puts == [])
+
+# approvals not yet met -> approve, but do not merge on someone else's behalf
+two = {"required_pull_request_reviews": {"required_approving_review_count": 2},
+       "required_status_checks": {"contexts": []}}
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING, protection=two,
+            reviews=[approve(ME)])
+ev = pb.evaluate_pr(gh, cfg(**ADV), "o", "r", 1, ME)
+chk("1 of 2 approvals -> approvals_met False", ev["approvals_met"] is False)
+gh = FakeGH(mkpr("unstable"), checkruns=FAILING, protection=two,
+            reviews=[approve(ME)])
+pb.apply_pr(gh, cfg(**ADV), "o", "r", 1, ME)
+chk("1 of 2 approvals -> no merge", gh.puts == [])
+
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")
 sys.exit(0 if ok == len(res) else 1)

@@ -863,6 +863,8 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         "approvals": "",
         "head_sha": "",
         "advisory": "",
+        "approvals_met": False,
+        "mergeable_state": "",
     }
     try:
         pr = gh.get(f"/repos/{owner}/{repo}/pulls/{number}")
@@ -920,6 +922,10 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     if req_approvals is None:
         req_approvals = cfg.get("default_required_approvals", 1)
     out["approvals"] = f"{approvals}/{req_approvals}"
+    # Recorded separately from the verdict: a CHECKS_ADVISORY PR can still have
+    # satisfied its approval requirement, and the action engine needs to know.
+    out["approvals_met"] = approvals >= req_approvals
+    out["mergeable_state"] = mergeable_state
 
     check_state, check_detail, failing_checks = _check_state(
         gh, owner, repo, head_sha, req_contexts)
@@ -1182,6 +1188,15 @@ def apply_pr(gh, cfg, owner, repo, number, me, dry_run=False):
             ready = False
     else:
         ready = (verdict == "READY_TO_MERGE")
+        # An advisory PR that has its approvals is merge-ready too — GitHub
+        # says the merge is unblocked, and you opted in twice (once for
+        # advisory checks, once for auto-merge). Without this, enabling both
+        # still never merged anything.
+        if (not ready and verdict == "CHECKS_ADVISORY"
+                and cfg.get("act_on_advisory_checks", False)
+                and ev.get("approvals_met")
+                and ev.get("mergeable_state") in ("clean", "unstable", "has_hooks")):
+            ready = True
 
     # The re-evaluation above may have seen a newer commit than the one we just
     # approved. Never merge a head the approval does not cover, and say so —
