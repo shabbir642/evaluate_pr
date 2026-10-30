@@ -120,6 +120,12 @@ DEFAULT_CONFIG = {
     # A commit with no checks at all is NOT green. Set true only for repos
     # that genuinely have no CI.
     "allow_no_checks": False,
+    # A red check only blocks a merge when the base branch requires it.
+    # GitHub says so itself via mergeable_state == "unstable": mergeable, but
+    # some NON-required check is red. prboard reports that as CHECKS_ADVISORY
+    # rather than CHECKS_FAILED. Acting on one is a separate decision: leave
+    # this false and advisory PRs are shown but never auto-approved.
+    "act_on_advisory_checks": False,
 }
 
 # No timeout means urllib can block forever on a half-open socket, which in
@@ -138,6 +144,7 @@ GITHUB_PR_URL_RE = re.compile(
 VERDICT_ORDER = [
     "READY_TO_MERGE",
     "NEEDS_YOUR_APPROVAL",
+    "CHECKS_ADVISORY",
     "MANUAL_REVIEW",
     "CHANGES_REQUESTED",
     "CONFLICT",
@@ -559,20 +566,77 @@ def _check_state(gh, owner, repo, sha, required_contexts):
     return "passing", f"{len(vals)} check(s) passing"
 
 
+def _rules_for_branch(gh, owner, repo, base):
+    """
+    Required approvals/contexts from repository *rulesets*.
+
+    Unlike classic branch protection, this endpoint only needs read access, so
+    it works with an ordinary PAT. Returns (approvals, contexts, known).
+    """
+    try:
+        rules = gh.get(f"/repos/{owner}/{repo}/rules/branches/{base}")
+    except ApiError:
+        return None, None, False
+    if not isinstance(rules, list):
+        return None, None, False
+    approvals, contexts = None, set()
+    for rule in rules:
+        params = rule.get("parameters") or {}
+        if rule.get("type") == "pull_request":
+            count = params.get("required_approving_review_count")
+            if count is not None:
+                approvals = max(approvals or 0, count)
+        elif rule.get("type") == "required_status_checks":
+            for chk in (params.get("required_status_checks") or []):
+                if chk.get("context"):
+                    contexts.add(chk["context"])
+    # An empty list is a real answer: this branch has no rulesets on it.
+    return approvals, (contexts or None), True
+
+
 def _branch_protection(gh, owner, repo, base):
-    """Return (required_approvals, required_contexts, known: bool)."""
+    """
+    Return (required_approvals, required_contexts, known: bool).
+
+    `known` False means we could not find out what the branch requires — the
+    caller must stay strict rather than assume nothing is required.
+    """
+    cache = getattr(gh, "_prot_cache", None)
+    if cache is None:
+        cache = gh._prot_cache = {}
+    key = (owner, repo, base)
+    if key in cache:
+        return cache[key]
+
+    classic_known = False
+    approvals, contexts = None, set()
     try:
         prot = gh.get(f"/repos/{owner}/{repo}/branches/{base}/protection")
     except ApiError:
-        return None, None, False
-    req_reviews = (prot.get("required_pull_request_reviews") or {})
-    required_approvals = req_reviews.get("required_approving_review_count")
-    rsc = prot.get("required_status_checks") or {}
-    contexts = set(rsc.get("contexts") or [])
-    for chk in (rsc.get("checks") or []):
-        if chk.get("context"):
-            contexts.add(chk["context"])
-    return required_approvals, (contexts or None), True
+        # Classic protection needs admin; a plain PAT gets 403/404 here. That
+        # is not evidence the branch is unprotected, so fall through to
+        # rulesets rather than concluding anything.
+        prot = None
+    if prot:
+        classic_known = True
+        req_reviews = (prot.get("required_pull_request_reviews") or {})
+        approvals = req_reviews.get("required_approving_review_count")
+        rsc = prot.get("required_status_checks") or {}
+        contexts = set(rsc.get("contexts") or [])
+        for chk in (rsc.get("checks") or []):
+            if chk.get("context"):
+                contexts.add(chk["context"])
+
+    rs_approvals, rs_contexts, rs_known = _rules_for_branch(gh, owner, repo, base)
+    if rs_known:
+        if rs_approvals is not None:
+            approvals = rs_approvals if approvals is None else max(approvals, rs_approvals)
+        if rs_contexts:
+            contexts |= rs_contexts
+
+    result = (approvals, (contexts or None), (classic_known or rs_known))
+    cache[key] = result
+    return result
 
 
 def _match_path(path, pat):
@@ -727,6 +791,7 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         "base": "",
         "approvals": "",
         "head_sha": "",
+        "advisory": "",
     }
     try:
         pr = gh.get(f"/repos/{owner}/{repo}/pulls/{number}")
@@ -836,10 +901,28 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         out["verdict"] = "CONFLICT"
         reasons.append("merge conflict with base")
         return out
+    # A red check only blocks when the base branch requires it, and GitHub has
+    # already applied branch protection when computing mergeable_state:
+    #   blocked  = something required is unsatisfied
+    #   unstable = mergeable, with non-required checks red
+    # So trust that over our own reading of the raw check list, which cannot
+    # see which contexts are required when protection is unreadable.
+    advisory = None
     if check_state == "failing":
-        out["verdict"] = "CHECKS_FAILED"
-        reasons.append(check_detail)
-        return out
+        if mergeable_state == "unstable":
+            advisory = check_detail
+        else:
+            # blocked, clean, or unknown with a red check: stay strict.
+            out["verdict"] = "CHECKS_FAILED"
+            reasons.append(check_detail)
+            if mergeable_state == "blocked":
+                reasons.append("branch protection is blocking the merge")
+            return out
+    elif mergeable_state == "unstable":
+        # Required contexts are known and green, but something else is red.
+        advisory = "non-required check(s) not passing"
+    if advisory:
+        out["advisory"] = advisory
 
     # If a red flag is present, it's manual no matter how green it is.
     if red_flags:
@@ -847,6 +930,8 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         reasons.extend(red_flags)
         if check_state in ("pending", "none"):
             reasons.append(check_detail)
+        if advisory:
+            reasons.append(f"{advisory} (not required — does not block merge)")
         return out
 
     # 'none' means CI has not reported yet — on a fresh push that is the normal
@@ -859,6 +944,20 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     if mergeable is None or mergeable_state in ("unknown", ""):
         out["verdict"] = "MERGEABILITY_UNKNOWN"
         reasons.append("GitHub still computing mergeability — re-run shortly")
+        return out
+
+    # Mergeable per GitHub, but something is red. Not a failure and not clean
+    # either — surface it as its own verdict so the call is yours to make.
+    if advisory:
+        out["verdict"] = "CHECKS_ADVISORY"
+        reasons.append(f"{advisory} — not required on '{base}', merge not blocked")
+        reasons.append(f"{approvals}/{req_approvals} approvals, state={mergeable_state}")
+        if req_contexts:
+            reasons.append("required checks on '%s' (%s) are green"
+                           % (base, ", ".join(sorted(req_contexts)[:3])))
+        else:
+            reasons.append("no required status checks found on '%s'; "
+                           "GitHub reports the merge as unblocked" % base)
         return out
 
     # Green zone.
@@ -888,6 +987,22 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
 # ----------------------------------------------------------------------------
 # Action engine (only runs under --apply; writes to GitHub)
 # ----------------------------------------------------------------------------
+ACTIONABLE_VERDICTS = ("NEEDS_YOUR_APPROVAL", "READY_TO_MERGE", "APPROVED_WAITING")
+
+
+def actionable_verdicts(cfg):
+    """
+    Verdicts the action engine is allowed to touch.
+
+    CHECKS_ADVISORY means GitHub would let the merge through but something is
+    red, so it is opt-in: seeing one on the board is useful, acting on one
+    unattended is a separate decision.
+    """
+    if cfg.get("act_on_advisory_checks", False):
+        return ACTIONABLE_VERDICTS + ("CHECKS_ADVISORY",)
+    return ACTIONABLE_VERDICTS
+
+
 def _audit(cfg, line):
     path = os.path.expanduser(cfg.get("audit_log") or "")
     if not path:
@@ -938,7 +1053,7 @@ def apply_pr(gh, cfg, owner, repo, number, me, dry_run=False):
 
     # The ONLY verdicts we ever act on. MANUAL_REVIEW (incl. master/prod,
     # sensitive paths, big diffs, bots) is deliberately excluded — never acted on.
-    if verdict not in ("NEEDS_YOUR_APPROVAL", "READY_TO_MERGE", "APPROVED_WAITING"):
+    if verdict not in actionable_verdicts(cfg):
         ev["action"] = f"no action ({verdict})"
         _audit(cfg, f"{owner}/{repo}#{number} SKIP {verdict}")
         return ev
@@ -954,7 +1069,7 @@ def apply_pr(gh, cfg, owner, repo, number, me, dry_run=False):
 
     # Approve if it's green, flag-free, and you haven't approved yet.
     approved_this_run = False
-    if verdict == "NEEDS_YOUR_APPROVAL" and not ev.get("you_approved"):
+    if verdict in ("NEEDS_YOUR_APPROVAL", "CHECKS_ADVISORY") and not ev.get("you_approved"):
         if dry_run:
             actions.append(f"would APPROVE @ {head_sha[:7]}")
             approved_this_run = True
@@ -1021,6 +1136,7 @@ def apply_pr(gh, cfg, owner, repo, number, me, dry_run=False):
 VERDICT_LABEL = {
     "READY_TO_MERGE": "READY → merge",
     "NEEDS_YOUR_APPROVAL": "NEEDS YOU → review",
+    "CHECKS_ADVISORY": "MERGEABLE (checks red)",
     "MANUAL_REVIEW": "MANUAL (red flag)",
     "CHANGES_REQUESTED": "CHANGES REQUESTED",
     "CONFLICT": "CONFLICT",
@@ -1063,8 +1179,8 @@ def render_table(results):
     print()
     # Reasons block for anything needing attention.
     attention = [r for r in results if r["verdict"] in
-                 ("READY_TO_MERGE", "NEEDS_YOUR_APPROVAL", "MANUAL_REVIEW",
-                  "CHANGES_REQUESTED", "CONFLICT", "CHECKS_FAILED")]
+                 ("READY_TO_MERGE", "NEEDS_YOUR_APPROVAL", "CHECKS_ADVISORY",
+                  "MANUAL_REVIEW", "CHANGES_REQUESTED", "CONFLICT", "CHECKS_FAILED")]
     if attention:
         print("Details:")
         for r in attention:
@@ -1202,8 +1318,7 @@ def main(argv=None):
                 if args.wait:
                     progress.update(f"{where} — waiting for checks…")
                     ev = wait_until_actionable(gh, cfg, owner, repo, number, me)
-                    if ev["verdict"] in ("NEEDS_YOUR_APPROVAL", "READY_TO_MERGE",
-                                         "APPROVED_WAITING"):
+                    if ev["verdict"] in actionable_verdicts(cfg):
                         progress.update(f"{where} — applying…")
                         ev = apply_pr(gh, cfg, owner, repo, number, me,
                                       dry_run=args.dry_run)

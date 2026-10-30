@@ -55,6 +55,9 @@
   "wait_timeout_seconds": 1800,
   "wait_interval_seconds": 30,
 
+  "_act_on_advisory_checks": "A red check only blocks a merge when the base branch requires it; GitHub says so via mergeable_state == 'unstable'. prboard reports those as CHECKS_ADVISORY instead of CHECKS_FAILED. Leave this false and they are shown but never auto-approved; set true to act on them.",
+  "act_on_advisory_checks": false,
+
   "_allow_no_checks": "A commit with no checks reported is treated as CHECKS_PENDING, not green — on a fresh push CI needs a moment to register. Set true only for repos that genuinely have no CI.",
   "allow_no_checks": false
 }

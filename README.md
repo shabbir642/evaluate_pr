@@ -27,13 +27,13 @@ prboard/
     secrets.env.example       token template
   tests/                     test_verdicts / test_actions / test_rules
                              test_failsafe / test_trigger / test_window
-                             test_progress
+                             test_progress / test_mergeability
 ```
 
 ## Running tests
 
 ```bash
-for t in verdicts actions rules failsafe trigger window progress; do python3 tests/test_$t.py || break; done
+for t in verdicts actions rules failsafe trigger window progress mergeability; do python3 tests/test_$t.py || break; done
 ```
 
 No network or tokens needed — they run against a mocked GitHub (and, for
@@ -179,6 +179,28 @@ Safety controls (in `config.json`):
 - `allow_no_checks` — **false by default.** A commit with no checks reported is
   treated as `CHECKS_PENDING`, not green; on a fresh push CI needs a moment to
   register. Set true only for repos that genuinely have no CI.
+
+### Failed checks don't always block
+
+A red check only blocks a merge when the base branch **requires** it. GitHub
+applies branch protection when it computes `mergeable_state`, so prboard trusts
+that rather than its own reading of the check list:
+
+| `mergeable_state` | meaning | verdict |
+| --- | --- | --- |
+| `blocked` | a required check or review is unsatisfied | `CHECKS_FAILED` |
+| `unstable` | mergeable; a **non-required** check is red | `CHECKS_ADVISORY` |
+| `dirty` | merge conflict | `CONFLICT` |
+| `clean` / `has_hooks` | green | proceeds |
+
+`CHECKS_ADVISORY` means GitHub would let the merge through. It is shown on the
+board with the failing check named, but the action engine **ignores it** unless
+you set `act_on_advisory_checks: true`.
+
+Required checks are read from classic branch protection (needs admin) and, 
+failing that, from repository rulesets (`/rules/branches/{branch}`, which needs
+only read access). If neither can be read, a red check keeps blocking — the
+strict reading, not the permissive one.
 
 Things that deliberately fail *closed* — each resolves to `MANUAL_REVIEW`, which
 the action engine never touches:

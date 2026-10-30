@@ -85,7 +85,7 @@ def handle_pr(owner, repo, number, web):
         me = gh.login()
         log(f"{owner}/{repo}#{number} watching (waiting for checks)…")
         ev = pb.wait_until_actionable(gh, CFG, owner, repo, number, me)
-        if ev["verdict"] in ("NEEDS_YOUR_APPROVAL", "READY_TO_MERGE", "APPROVED_WAITING"):
+        if ev["verdict"] in pb.actionable_verdicts(CFG):
             ev = pb.apply_pr(gh, CFG, owner, repo, number, me, dry_run=DRY_RUN)
         action = ev.get("action", "no action")
         label = pb.VERDICT_LABEL.get(ev["verdict"], ev["verdict"])
@@ -93,7 +93,7 @@ def handle_pr(owner, repo, number, web):
         # Only ping you when something meaningful happened or needs you.
         if any(w in action for w in ("APPROVED", "MERGED", "failed", "would")) \
                 or ev["verdict"] in ("MANUAL_REVIEW", "CONFLICT", "CHECKS_FAILED",
-                                     "CHANGES_REQUESTED"):
+                                     "CHANGES_REQUESTED", "CHECKS_ADVISORY"):
             mode = " [DRY-RUN]" if DRY_RUN else ""
             _notify(web, f"{owner}/{repo}#{number} [{label}]{mode}\n"
                          f"{action}\n{ev['url']}")
