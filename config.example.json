@@ -1,0 +1,54 @@
+{
+  "_comment": "Copy to ~/.config/prboard/config.json and edit. gate_rules is the editable checklist: add/remove entries to add/remove conditions — no code changes. A rule fires when ALL predicates in 'when' match; action 'manual' = you handle it, 'skip' = ignore the PR.",
+
+  "slack_channel": "C043639SVEY",
+  "slack_scan_limit": 200,
+  "default_required_approvals": 1,
+
+  "gate_rules": [
+    {"name": "targets protected branch", "action": "manual",
+     "when": {"base_in": ["master", "prod", "production", "main"]}},
+
+    {"name": "touches sensitive paths", "action": "manual",
+     "when": {"files_match": [
+       ".github/workflows/*", ".github/*", "**/Dockerfile", "Dockerfile*",
+       "**/*.tf", "**/migrations/*", "**/migration/*", "**/*.env*",
+       "**/secrets*", "package.json", "**/package.json",
+       "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+       "**/deployment*.yml", "**/deployment*.yaml", "**/helm/**", "**/k8s/**"]}},
+
+    {"name": "large diff (files)", "action": "manual",
+     "when": {"changed_files_gt": 40}},
+
+    {"name": "large diff (lines)", "action": "manual",
+     "when": {"changed_lines_gt": 800}},
+
+    {"name": "bot author", "action": "manual",
+     "when": {"author_is_bot": true}},
+
+    {"name": "external author", "action": "manual",
+     "when": {"author_association_in": ["NONE", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR"]}},
+
+    {"name": "hold / WIP label", "action": "skip",
+     "when": {"labels_any": ["wip", "do not merge", "do-not-merge", "hold", "on hold"]}}
+  ],
+
+  "_gate_predicates_reference": {
+    "base_in / base_not_in": "[branch names]",
+    "repo_in / repo_not_in": "[\"owner/repo\", ...]",
+    "files_match": "[glob, ...] — any changed file matches",
+    "changed_files_gt": "integer",
+    "changed_lines_gt": "integer (additions + deletions)",
+    "author_is_bot": "true/false",
+    "author_association_in": "[\"NONE\",\"FIRST_TIME_CONTRIBUTOR\", ...]",
+    "labels_any": "[label, ...] (case-insensitive)",
+    "title_regex": "a regex matched against the PR title"
+  },
+
+  "enabled": true,
+  "enable_auto_merge": false,
+  "merge_method": "squash",
+  "audit_log": "~/.local/share/prboard/audit.log",
+  "wait_timeout_seconds": 1800,
+  "wait_interval_seconds": 30
+}

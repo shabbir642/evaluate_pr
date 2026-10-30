@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent to keep prwatch running (and restart it on crash / at login).
+  Install:
+    1. Edit the paths below (REPLACE /Users/USERNAME/tools/prboard with your repo path).
+    2. cp deploy/com.vmock.prwatch.plist ~/Library/LaunchAgents/
+    3. launchctl load  ~/Library/LaunchAgents/com.vmock.prwatch.plist
+       launchctl start com.vmock.prwatch
+  Logs: ~/Library/Logs/prwatch.out / prwatch.err
+  Stop:  launchctl unload ~/Library/LaunchAgents/com.vmock.prwatch.plist
+  Note: runs only while you're logged in and the Mac is awake.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vmock.prwatch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/USERNAME/tools/prboard/deploy/run-prwatch.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PRBOARD_DIR</key>
+        <string>/Users/USERNAME/tools/prboard</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/Library/Logs/prwatch.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/Library/Logs/prwatch.err</string>
+</dict>
+</plist>
