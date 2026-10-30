@@ -35,12 +35,23 @@ def say(mark, text, detail=""):
         problems.append(text)
 
 
-def slack(method, token, **params):
+def slack(method, token, post=False, **params):
     url = f"https://slack.com/api/{method}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
     return pb._request(url, {"Authorization": f"Bearer {token}",
-                             "User-Agent": "prboard-preflight/1.0"})
+                             "User-Agent": "prboard-preflight/1.0"},
+                       method="POST" if post else "GET",
+                       data={} if post else None)
+
+
+def header(headers, name):
+    """Slack sends header names lowercased, and dict() keeps that casing."""
+    name = name.lower()
+    for key, value in headers.items():
+        if key.lower() == name:
+            return value
+    return ""
 
 
 def main():
@@ -92,7 +103,10 @@ def main():
                 say(OK, f"bot authenticates as @{data.get('user')} ({bot_user}) "
                         f"in {data.get('team')}")
                 scopes = {s.strip() for s in
-                          (headers.get("X-OAuth-Scopes") or "").split(",") if s.strip()}
+                          header(headers, "x-oauth-scopes").split(",") if s.strip()}
+                if not scopes:
+                    say(WARN, "Slack did not report the granted scopes",
+                        "skipping the scope checks below")
         except pb.ApiError as e:
             say(BAD, f"could not reach Slack with the bot token: {e}")
 
@@ -116,9 +130,16 @@ def main():
             data, _ = slack("conversations.info", bot_token, channel=channel)
             if not data.get("ok"):
                 err = data.get("error")
-                hint = ("the bot is not in the channel — run "
-                        f"/invite @yourapp in it" if err == "channel_not_found" else "")
-                say(BAD, f"conversations.info failed: {err}", hint)
+                if err == "missing_scope":
+                    say(WARN, "cannot verify the channel — needs groups:read",
+                        "prwatch itself does NOT need groups:read; add it only if "
+                        "you want this check to run. Verify by hand instead: the "
+                        "bot must be invited to the channel.")
+                elif err in ("channel_not_found", "not_in_channel"):
+                    say(BAD, f"the bot cannot see {channel}: {err}",
+                        "run /invite @evaluate_pr in the channel")
+                else:
+                    say(BAD, f"conversations.info failed: {err}")
             else:
                 ch = data.get("channel", {})
                 kind = "private" if ch.get("is_private") else "public"
@@ -137,7 +158,8 @@ def main():
     # --- 4. app token: does Socket Mode work? ----------------------------
     if app_token.startswith("xapp-"):
         try:
-            data, _ = slack("apps.connections.open", app_token)
+            # Documented POST-only; a GET can come back as insecure_request.
+            data, _ = slack("apps.connections.open", app_token, post=True)
             if data.get("ok"):
                 say(OK, "Socket Mode connects (connections:write is granted)")
             else:
@@ -146,6 +168,8 @@ def main():
                     "missing_scope": "the app-level token needs connections:write",
                     "invalid_auth": "that is not a valid app-level token — it is the "
                                     "xapp- one from Socket Mode, not the xoxb- bot token",
+                    "insecure_request": "this call must be a POST — a preflight bug "
+                                        "if you still see it",
                     "not_allowed_token_type": "this needs the xapp- app-level token, "
                                               "not a bot or user token",
                 }.get(err, "")

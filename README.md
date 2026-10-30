@@ -312,9 +312,14 @@ set -a; . ~/.config/prboard/secrets.env; set +a; .venv/bin/python3 deploy/prefli
 ```
 
 It verifies both tokens are the right kind, that the bot authenticates, that it
-holds `groups:history` and `chat:write`, that it is actually a member of the
-channel, that Socket Mode opens, and that GitHub auth works — then prints what
-the process would do once triggered. It never prints a token.
+holds `groups:history` and `chat:write`, that Socket Mode opens, and that GitHub
+auth works — then prints what the process would do once triggered. It never
+prints a token.
+
+The channel-membership check needs `groups:read`, which **prwatch itself does
+not use**. Without it you get a warning, not a failure — add the scope only if
+you want that one check to run, otherwise just confirm by hand that the bot is
+in the channel.
 
 ### Run it
 
