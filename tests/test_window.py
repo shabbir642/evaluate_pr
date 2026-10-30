@@ -91,6 +91,35 @@ finally:
     pb._request = real_request
     os.environ.pop("SLACK_TOKEN", None)
 
+# --- naming a PR directly: --pr takes the forms people actually paste ------
+FULL = "https://github.com/vmockinc/career-service-ui/pull/833"
+WANT = ("vmockinc", "career-service-ui", 833)
+for text in (FULL,
+             FULL + "/files",
+             FULL + "#discussion_r1",
+             FULL + "?w=1",
+             "http://github.com/vmockinc/career-service-ui/pull/833",
+             "github.com/vmockinc/career-service-ui/pull/833",
+             "www.github.com/vmockinc/career-service-ui/pull/833",
+             "ghe.corp.example/vmockinc/career-service-ui/pull/833",
+             "vmockinc/career-service-ui/pull/833",
+             "vmockinc/career-service-ui#833",
+             "vmockinc/career-service-ui/833",
+             "   vmockinc/career-service-ui#833   "):
+    chk(f"parses {text.strip()[:46]}", pb.parse_pr_ref(text) == WANT)
+
+for bad in ("833", "vmockinc/career-service-ui", "not a pr", "", None,
+            "https://github.com/vmockinc/career-service-ui",
+            "vmockinc/career-service-ui#abc"):
+    chk(f"rejects {bad!r}", pb.parse_pr_ref(bad) is None)
+
+# the strict scanner must stay strict: it reads arbitrary Slack text, where
+# "owner/repo#123" style noise would produce false positives.
+chk("free-text scanner still ignores shorthand",
+    pb.GITHUB_PR_URL_RE.search("see vmockinc/career-service-ui#833") is None)
+chk("free-text scanner still finds real links",
+    pb.GITHUB_PR_URL_RE.search(f"please review {FULL} today") is not None)
+
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")
 sys.exit(0 if ok == len(res) else 1)

@@ -111,6 +111,7 @@ chmod +x prboard.py
 ./prboard.py --slack         # also scan the Slack channel for PR links
 ./prboard.py --repo vmockinc/cmc-student-view     # one repo's open PRs
 ./prboard.py --pr https://github.com/vmockinc/cmc-student-view/pull/1017
+./prboard.py --pr vmockinc/cmc-student-view#1017   # same thing, shorthand
 ./prboard.py --slack --json  # machine-readable, for piping
 ```
 
@@ -129,7 +130,26 @@ per run:
 ./prboard.py --since-hours 0     # no window at all
 ```
 
-It never applies to an explicit `--pr URL`: if you name a PR, you get it.
+It never applies to an explicit `--pr`: if you name a PR, you get it.
+
+### Acting on one named PR
+
+`--pr` skips discovery entirely and works on just what you name — pair it with
+`--apply` to act on a single PR:
+
+```bash
+./prboard.py --apply --dry-run --pr vmockinc/career-service-ui#833
+```
+
+It accepts a full URL (including `/files`, `#anchor` and `?query` suffixes), a
+bare `github.com/owner/repo/pull/123`, another host for GitHub Enterprise, or
+the `owner/repo#123` shorthand. The Slack scanner stays strict about full URLs
+on purpose — it reads free-form messages, where loose matching would pick up
+things that aren't PR links.
+
+`--act-on-advisory` turns on `act_on_advisory_checks` for one run only, so you
+can try it without changing stored config. `blocking_check_patterns` still
+wins over it.
 
 A run is mostly blocking network calls, so it draws a spinner on **stderr**
 saying what it is waiting on — `[2/5] vmockinc/career-service-ui#786 —

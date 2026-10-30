@@ -149,6 +149,43 @@ GITHUB_PR_URL_RE = re.compile(
     r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)"
 )
 
+
+def parse_pr_ref(text):
+    """
+    Parse one PR reference typed on the command line.
+
+    Deliberately more forgiving than GITHUB_PR_URL_RE, which stays strict
+    because it scans free-form Slack messages where a loose pattern would
+    match things that aren't PR links. Here you have named a PR on purpose.
+
+    Accepts:
+        https://github.com/owner/repo/pull/123   (plus /files, #anchor, ?query)
+        github.com/owner/repo/pull/123           (no scheme)
+        ghe.corp.example/owner/repo/pull/123     (other hosts)
+        owner/repo/pull/123
+        owner/repo#123
+        owner/repo/123
+
+    Returns (owner, repo, number), or None if it isn't a PR reference.
+    """
+    text = (text or "").strip()
+    m = GITHUB_PR_URL_RE.search(text)
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+
+    body = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text, flags=re.I)
+    body = body.split("?", 1)[0]
+    # The URL form is already handled above, so a '#' here is the owner/repo#N
+    # separator rather than a fragment.
+    parts = [p for p in body.replace("#", "/").split("/") if p]
+    # A first segment containing a dot is a hostname, not an owner.
+    if parts and ("." in parts[0] or parts[0] == "localhost"):
+        parts = parts[1:]
+    parts = [p for p in parts if p != "pull"]
+    if len(parts) >= 3 and parts[2].isdigit():
+        return parts[0], parts[1], int(parts[2])
+    return None
+
 # Verdict labels and the order they sort in (most "needs you" first).
 VERDICT_ORDER = [
     "READY_TO_MERGE",
@@ -1255,8 +1292,10 @@ def main(argv=None):
         description="Read-only board of PRs you review (no actions taken).")
     ap.add_argument("--repo", action="append", default=[],
                     help="owner/repo — list that repo's open PRs (repeatable)")
-    ap.add_argument("--pr", action="append", default=[],
-                    help="a single PR URL to evaluate (repeatable)")
+    ap.add_argument("--pr", action="append", default=[], metavar="REF",
+                    help="act on this PR only — no searching. Takes a full URL, "
+                         "a bare github.com/owner/repo/pull/123, or the "
+                         "owner/repo#123 shorthand. Repeatable.")
     ap.add_argument("--slack", action="store_true",
                     help="also scan the configured Slack channel for PR links")
     ap.add_argument("--no-github", action="store_true",
@@ -1280,9 +1319,17 @@ def main(argv=None):
                     help="with --apply: wait for pending checks to finish, then act")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --apply: print what it WOULD do, change nothing")
+    ap.add_argument("--act-on-advisory", action="store_true",
+                    help="with --apply: also act on CHECKS_ADVISORY — PRs GitHub "
+                         "would let through with a non-required check red. "
+                         "One run only; config stays as it is.")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
+    if args.act_on_advisory:
+        # Per-run override, so trying this once doesn't mean loosening the
+        # stored config. blocking_check_patterns still wins over it.
+        cfg["act_on_advisory_checks"] = True
     progress = Progress(enabled=not args.no_progress)
     since = window_start(cfg, args.since_hours)
     hours = args.since_hours if args.since_hours is not None else cfg.get(
@@ -1303,11 +1350,13 @@ def main(argv=None):
     used_feed = False          # the window only describes feed-driven discovery
     if args.pr:
         for u in args.pr:
-            m = GITHUB_PR_URL_RE.search(u)
-            if m:
-                candidates.add((m.group(1), m.group(2), int(m.group(3))))
+            ref = parse_pr_ref(u)
+            if ref:
+                candidates.add(ref)
             else:
-                print(f"warning: not a PR url: {u}", file=sys.stderr)
+                print(f"warning: not a PR reference: {u}\n"
+                      "  expected a URL, github.com/owner/repo/pull/123, "
+                      "or owner/repo#123", file=sys.stderr)
     for rp in args.repo:
         if "/" not in rp:
             print(f"warning: --repo expects owner/repo, got {rp}", file=sys.stderr)
@@ -1357,7 +1406,9 @@ def main(argv=None):
     if not used_feed:
         scope_desc = "named PRs"
     if not candidates:
-        if since:
+        if not used_feed:
+            print("No usable PR references given.")
+        elif since:
             print(f"No candidate PRs updated in the {scope_desc}. "
                   "(Try --since-hours 0, --slack, --repo owner/repo, or --pr URL.)")
         else:
@@ -1394,8 +1445,9 @@ def main(argv=None):
         print(json.dumps(results, indent=2))
     elif args.apply:
         mode = "DRY-RUN" if args.dry_run else "LIVE"
+        advisory_note = (" +advisory" if cfg.get("act_on_advisory_checks") else "")
         print(f"\nPR apply for @{me}  —  {len(results)} PR(s)  "
-              f"({scope_desc})  [{mode}]\n")
+              f"({scope_desc})  [{mode}{advisory_note}]\n")
         for r in results:
             print(f"  {r['repo']}#{r['number']}  [{VERDICT_LABEL.get(r['verdict'], r['verdict'])}]"
                   f"  ->  {r.get('action', 'no action')}")
