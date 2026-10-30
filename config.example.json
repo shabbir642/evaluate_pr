@@ -50,5 +50,8 @@
   "merge_method": "squash",
   "audit_log": "~/.local/share/prboard/audit.log",
   "wait_timeout_seconds": 1800,
-  "wait_interval_seconds": 30
+  "wait_interval_seconds": 30,
+
+  "_allow_no_checks": "A commit with no checks reported is treated as CHECKS_PENDING, not green — on a fresh push CI needs a moment to register. Set true only for repos that genuinely have no CI.",
+  "allow_no_checks": false
 }
