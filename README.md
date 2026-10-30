@@ -27,12 +27,13 @@ prboard/
     secrets.env.example       token template
   tests/                     test_verdicts / test_actions / test_rules
                              test_failsafe / test_trigger / test_window
+                             test_progress
 ```
 
 ## Running tests
 
 ```bash
-for t in verdicts actions rules failsafe trigger window; do python3 tests/test_$t.py || break; done
+for t in verdicts actions rules failsafe trigger window progress; do python3 tests/test_$t.py || break; done
 ```
 
 No network or tokens needed — they run against a mocked GitHub (and, for
@@ -129,6 +130,11 @@ per run:
 ```
 
 It never applies to an explicit `--pr URL`: if you name a PR, you get it.
+
+A run is mostly blocking network calls, so it draws a spinner on **stderr**
+saying what it is waiting on — `[2/5] vmockinc/career-service-ui#786 —
+evaluating…`. It turns itself off when stderr isn't a terminal, so pipes,
+`--json`, launchd and CI logs stay clean; `--no-progress` forces it off.
 
 ## Notes & limitations
 

@@ -21,10 +21,13 @@ Env it reads: GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com),
 
 import argparse
 import datetime
+import itertools
 import json
 import os
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -146,6 +149,97 @@ VERDICT_ORDER = [
     "DRAFT_OR_HOLD",
     "ERROR",
 ]
+
+
+# ----------------------------------------------------------------------------
+# Progress (stderr only, and only when someone's watching)
+# ----------------------------------------------------------------------------
+class Progress:
+    """
+    A one-line spinner on stderr saying what we're waiting on.
+
+    A run is mostly blocking network calls — ~6 per PR at roughly 0.7s each —
+    so without this it looks hung. It writes to stderr, never stdout, so
+    --json and pipes stay clean, and it disables itself when stderr isn't a
+    terminal (pipes, launchd, CI) rather than spraying escape codes into a log.
+    """
+
+    FRAMES = "|/-\\"
+    INTERVAL = 0.1
+
+    def __init__(self, enabled=True, stream=None):
+        self.stream = stream or sys.stderr
+        try:
+            tty = self.stream.isatty()
+        except Exception:
+            tty = False
+        self.enabled = bool(enabled and tty)
+        self._label = ""
+        self._width = 0
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    # -- lifecycle ---------------------------------------------------------
+    def start(self, label=""):
+        self._label = label
+        if not self.enabled or self._thread is not None:
+            return self
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def update(self, label):
+        """Change the message in place; also works while stopped."""
+        with self._lock:
+            self._label = label
+        if self.enabled and self._thread is None:
+            self.start(label)
+
+    def stop(self):
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self._clear()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+    # -- internals ---------------------------------------------------------
+    def _spin(self):
+        for frame in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                return
+            with self._lock:
+                label = self._label
+            self._write(f"{frame} {label}" if label else frame)
+            if self._stop.wait(self.INTERVAL):
+                return
+
+    def _write(self, text):
+        try:
+            self.stream.write("\r" + text.ljust(self._width))
+            self.stream.flush()
+            self._width = max(self._width, len(text))
+        except Exception:
+            # A broken stderr must never take the run down with it.
+            self.enabled = False
+
+    def _clear(self):
+        if not self.enabled or not self._width:
+            return
+        try:
+            self.stream.write("\r" + " " * self._width + "\r")
+            self.stream.flush()
+        except Exception:
+            pass
+        self._width = 0
 
 
 # ----------------------------------------------------------------------------
@@ -809,7 +903,6 @@ def _audit(cfg, line):
 
 def wait_until_actionable(gh, cfg, owner, repo, number, me):
     """Poll a single PR until its verdict is terminal (not pending/unknown)."""
-    import time
     timeout = cfg.get("wait_timeout_seconds", 1800)
     interval = cfg.get("wait_interval_seconds", 30)
     deadline = time.time() + timeout
@@ -1003,6 +1096,9 @@ def main(argv=None):
                     help="only consider PRs updated in the last N hours "
                          "(default 24, from config discovery_window_hours; "
                          "0 = no window). Does not apply to an explicit --pr.")
+    ap.add_argument("--no-progress", action="store_true",
+                    help="don't draw the progress spinner (it is off "
+                         "automatically when stderr isn't a terminal)")
     ap.add_argument("--json", action="store_true", help="output JSON")
     ap.add_argument("--config", help="path to a config.json")
     ap.add_argument("--apply", action="store_true",
@@ -1014,6 +1110,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
+    progress = Progress(enabled=not args.no_progress)
     since = window_start(cfg, args.since_hours)
     hours = args.since_hours if args.since_hours is not None else cfg.get(
         "discovery_window_hours", 24)
@@ -1023,7 +1120,11 @@ def main(argv=None):
         print(f"warning: gate_rules — {problem}", file=sys.stderr)
     gh = GitHub(os.environ.get("GITHUB_TOKEN"),
                 os.environ.get("GITHUB_API_URL", "https://api.github.com"))
-    me = gh.login()
+    progress.start("authenticating with GitHub…")
+    try:
+        me = gh.login()
+    finally:
+        progress.stop()
 
     candidates = set()
     used_feed = False          # the window only describes feed-driven discovery
@@ -1043,6 +1144,7 @@ def main(argv=None):
             # /pulls has no date filter, but sorting by recency lets us stop at
             # the first PR past the window instead of evaluating the whole list.
             used_feed = True
+            progress.update(f"listing open PRs in {rp}…")
             prs = gh.get_paginated(
                 f"/repos/{owner}/{repo}/pulls",
                 {"state": "open", "sort": "updated", "direction": "desc"},
@@ -1068,14 +1170,17 @@ def main(argv=None):
             print("note: --apply uses the review-requested feed only; pass "
                   "--include-mentions to also act on @-mentions.", file=sys.stderr)
         used_feed = True
+        progress.update(f"searching GitHub for PRs ({scope_desc})…")
         candidates |= discover_from_github(
             gh, me, include_mentions=include_mentions, since=since)
     elif not args.no_github and not args.repo and args.pr:
         pass  # explicit PRs only
     if args.slack:
         used_feed = True
+        progress.update(f"scanning Slack {cfg.get('slack_channel', '')} ({scope_desc})…")
         candidates |= discover_from_slack(cfg, since=since)
 
+    progress.stop()
     if not used_feed:
         scope_desc = "named PRs"
     if not candidates:
@@ -1087,20 +1192,31 @@ def main(argv=None):
         return 0
 
     results = []
-    for owner, repo, number in sorted(candidates):
-        if args.apply:
-            if args.wait:
-                ev = wait_until_actionable(gh, cfg, owner, repo, number, me)
-                if ev["verdict"] in ("NEEDS_YOUR_APPROVAL", "READY_TO_MERGE",
-                                     "APPROVED_WAITING"):
+    todo = sorted(candidates)
+    # Each PR costs ~6 sequential GitHub calls, so this is the slow part and
+    # the only place a counter is worth showing.
+    try:
+        for i, (owner, repo, number) in enumerate(todo, 1):
+            where = f"[{i}/{len(todo)}] {owner}/{repo}#{number}"
+            if args.apply:
+                if args.wait:
+                    progress.update(f"{where} — waiting for checks…")
+                    ev = wait_until_actionable(gh, cfg, owner, repo, number, me)
+                    if ev["verdict"] in ("NEEDS_YOUR_APPROVAL", "READY_TO_MERGE",
+                                         "APPROVED_WAITING"):
+                        progress.update(f"{where} — applying…")
+                        ev = apply_pr(gh, cfg, owner, repo, number, me,
+                                      dry_run=args.dry_run)
+                else:
+                    progress.update(f"{where} — applying…")
                     ev = apply_pr(gh, cfg, owner, repo, number, me,
                                   dry_run=args.dry_run)
             else:
-                ev = apply_pr(gh, cfg, owner, repo, number, me,
-                              dry_run=args.dry_run)
-        else:
-            ev = evaluate_pr(gh, cfg, owner, repo, number, me)
-        results.append(ev)
+                progress.update(f"{where} — evaluating…")
+                ev = evaluate_pr(gh, cfg, owner, repo, number, me)
+            results.append(ev)
+    finally:
+        progress.stop()
 
     if args.json:
         print(json.dumps(results, indent=2))
