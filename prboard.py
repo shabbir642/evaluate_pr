@@ -543,8 +543,9 @@ def _latest_reviews(reviews):
 def _check_state(gh, owner, repo, sha, required_contexts):
     """
     Summarize checks for a commit. Returns (state, detail) where state is one
-    of 'passing' | 'pending' | 'failing' | 'none' | 'error', plus the list of
-    failing check names so the caller can decide which ones actually matter.
+    of 'passing' | 'pending' | 'failing' | 'none' | 'error', plus the failing
+    and the still-running check names, so the caller can decide which ones
+    actually matter and whether the picture is even complete yet.
     'none' means the commit genuinely has no checks; 'error' means we could not
     find out. Neither is ever treated as green by the caller.
     Considers GitHub Actions check-runs AND legacy commit statuses.
@@ -590,8 +591,8 @@ def _check_state(gh, owner, repo, sha, required_contexts):
         # An endpoint we could not read might have been hiding a failing check.
         err = runs_err or statuses_err
         if err is not None:
-            return "error", f"could not read checks ({err})", []
-        return "none", "no checks reported", []
+            return "error", f"could not read checks ({err})", [], []
+        return "none", "no checks reported", [], []
 
     if required_contexts:
         relevant = {n: s for n, s in results.items() if n in required_contexts}
@@ -605,12 +606,16 @@ def _check_state(gh, owner, repo, sha, required_contexts):
 
     vals = list(scope.values())
     failing = sorted(n for n, v in scope.items() if v == "failing" and n)
+    pending = sorted(n for n, v in scope.items() if v == "pending" and n)
     if failing:
-        return "failing", f"{_names(failing)} failing", failing
+        # 'failing' outranks 'pending' for the headline state — a failed
+        # required check will not un-fail — but the pending names go back too,
+        # so the caller can tell the picture is still incomplete.
+        return "failing", f"{_names(failing)} failing", failing, pending
     if any(v == "pending" for v in vals):
         n = sum(1 for v in vals if v == "pending")
-        return "pending", f"{n} check(s) pending", []
-    return "passing", f"{len(vals)} check(s) passing", []
+        return "pending", f"{n} check(s) pending", [], pending
+    return "passing", f"{len(vals)} check(s) passing", [], []
 
 
 def _rules_for_branch(gh, owner, repo, base):
@@ -927,7 +932,7 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     out["approvals_met"] = approvals >= req_approvals
     out["mergeable_state"] = mergeable_state
 
-    check_state, check_detail, failing_checks = _check_state(
+    check_state, check_detail, failing_checks, pending_checks = _check_state(
         gh, owner, repo, head_sha, req_contexts)
     if check_state == "error":
         gate_errors.append(check_detail)
@@ -994,6 +999,13 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
             reasons.append(f"{_names(forced_blocking)} failing "
                            "(listed in blocking_check_patterns)")
             return out
+        if pending_checks:
+            # Something is still running. Whatever it reports could change the
+            # answer, so wait for it rather than merging on a partial picture.
+            out["verdict"] = "CHECKS_PENDING"
+            reasons.append(f"{_names(failing_checks)} failing, but "
+                           f"{_names(pending_checks)} still running")
+            return out
         if mergeable_state == "unstable":
             advisory = _names(failing_checks)
         elif named_advisory and len(named_advisory) == len(failing_checks):
@@ -1007,9 +1019,10 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
             if mergeable_state == "blocked":
                 reasons.append("branch protection is blocking the merge")
             return out
-    elif mergeable_state == "unstable":
-        # Required contexts are known and green, but something else is red.
-        advisory = "non-required check(s)"
+    # Deliberately no 'elif mergeable_state == "unstable"' here: GitHub can
+    # report unstable over something we cannot see, and raising an advisory we
+    # can't name would both read as a blank RED column and quietly demote a PR
+    # that used to be READY_TO_MERGE. An advisory needs a named failing check.
     if advisory:
         out["advisory"] = advisory
 

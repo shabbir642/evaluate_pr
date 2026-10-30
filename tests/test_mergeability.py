@@ -337,6 +337,57 @@ gh = FakeGH(mkpr("unstable"), checkruns=FAILING, protection=two,
 pb.apply_pr(gh, cfg(**ADV), "o", "r", 1, ME)
 chk("1 of 2 approvals -> no merge", gh.puts == [])
 
+# --- a check still running always wins over acting ------------------------
+# Regression: _check_state ranks "failing" above "pending", so once one check
+# failed the still-running ones stopped counting and an advisory PR merged
+# while CI was mid-flight.
+R = lambda n, st, c=None: {"name": n, "status": st, "conclusion": c}
+ADV2 = dict(act_on_advisory_checks=True, enable_auto_merge=True)
+
+def runs(*rs): return {"check_runs": list(rs)}
+
+for label, cr in [
+        ("single check in_progress", runs(R("ci", "in_progress"))),
+        ("single check queued", runs(R("ci", "queued"))),
+        ("one green, one running", runs(R("ci", "completed", "success"),
+                                        R("g", "in_progress"))),
+        ("one FAILED, one running", runs(R("ci", "completed", "failure"),
+                                         R("g", "in_progress")))]:
+    gh = FakeGH(mkpr("unstable"), checkruns=cr, reviews=[approve(ME)])
+    chk(f"{label} -> CHECKS_PENDING",
+        pb.evaluate_pr(gh, cfg(**ADV2), "o", "r", 1, ME)["verdict"] == "CHECKS_PENDING")
+    gh = FakeGH(mkpr("unstable"), checkruns=cr, reviews=[approve(ME)])
+    pb.apply_pr(gh, cfg(**ADV2), "o", "r", 1, ME)
+    chk(f"{label} -> no writes", gh.posts == [] and gh.puts == [])
+
+gh = FakeGH(mkpr("unstable"),
+            checkruns=runs(R("ci", "completed", "failure"), R("g", "in_progress")),
+            reviews=[approve(ME)])
+ev = pb.evaluate_pr(gh, cfg(**ADV2), "o", "r", 1, ME)
+chk("pending-with-failure names both",
+    any("ci failing" in r and "g still running" in r for r in ev["reasons"]))
+
+# once everything has reported, the advisory path resumes
+gh = FakeGH(mkpr("unstable"),
+            checkruns=runs(R("ci", "completed", "success"),
+                           R("g", "completed", "failure")),
+            reviews=[approve(ME)])
+chk("all reported, one failed -> CHECKS_ADVISORY",
+    pb.evaluate_pr(gh, cfg(**ADV2), "o", "r", 1, ME)["verdict"] == "CHECKS_ADVISORY")
+
+
+# --- unstable with nothing visibly red is still just ready ----------------
+# GitHub can report unstable over something we cannot see. Raising an advisory
+# we cannot name would blank the RED column and demote a ready PR.
+gh = FakeGH(mkpr("unstable"), checkruns=PASSING, reviews=[approve(ME)])
+ev = pb.evaluate_pr(gh, cfg(), "o", "r", 1, ME)
+chk("unstable + all green -> READY_TO_MERGE", ev["verdict"] == "READY_TO_MERGE")
+chk("unstable + all green raises no advisory", not ev["advisory"])
+
+gh = FakeGH(mkpr("unstable"), checkruns=PASSING, reviews=[approve(ME)])
+pb.apply_pr(gh, cfg(enable_auto_merge=True), "o", "r", 1, ME)
+chk("unstable + all green merges on enable_auto_merge alone", len(gh.puts) == 1)
+
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")
 sys.exit(0 if ok == len(res) else 1)
