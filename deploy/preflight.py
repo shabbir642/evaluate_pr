@@ -27,12 +27,15 @@ _spec.loader.exec_module(pb)
 
 OK, BAD, WARN = "  ok  ", " FAIL ", " warn "
 problems = []
+unverified = []
 
 
-def say(mark, text, detail=""):
+def say(mark, text, detail="", skipped=False):
     print(f"[{mark}] {text}" + (f"\n         {detail}" if detail else ""))
     if mark is BAD:
         problems.append(text)
+    elif skipped:
+        unverified.append(text)
 
 
 def slack(method, token, post=False, **params):
@@ -131,10 +134,13 @@ def main():
             if not data.get("ok"):
                 err = data.get("error")
                 if err == "missing_scope":
-                    say(WARN, "cannot verify the channel — needs groups:read",
-                        "prwatch itself does NOT need groups:read; add it only if "
-                        "you want this check to run. Verify by hand instead: the "
-                        "bot must be invited to the channel.")
+                    say(WARN, "cannot verify the bot is IN the channel "
+                              "(needs groups:read)",
+                        "prwatch does not need groups:read to run, but it DOES "
+                        "need the invite. Without it groups:history grants "
+                        "nothing for this channel and prwatch will never fire. "
+                        "Either add groups:read and re-run, or check the member "
+                        "list by hand.", skipped=True)
                 elif err in ("channel_not_found", "not_in_channel"):
                     say(BAD, f"the bot cannot see {channel}: {err}",
                         "run /invite @evaluate_pr in the channel")
@@ -209,6 +215,14 @@ def main():
     if problems:
         print(f"{len(problems)} problem(s) to fix before running prwatch.\n")
         return 1
+    if unverified:
+        # Saying "ready to run" while the most important prerequisite went
+        # unchecked is worse than not checking at all.
+        print(f"No failures, but {len(unverified)} check(s) could NOT be run:")
+        for item in unverified:
+            print(f"  - {item}")
+        print("\nConfirm these by hand before trusting a quiet log.\n")
+        return 0
     print("All checks passed — prwatch is ready to run.\n")
     return 0
 
