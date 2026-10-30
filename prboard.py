@@ -20,6 +20,7 @@ Env it reads: GITHUB_TOKEN, GITHUB_API_URL (default https://api.github.com),
 """
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -64,6 +65,10 @@ DEFAULT_CONFIG = {
     "slack_scan_limit": 200,
     # Default required approvals when branch protection can't be read.
     "default_required_approvals": 1,
+    # Only look at PRs touched in the last N hours. Evaluating one candidate
+    # costs ~6 GitHub calls, so narrowing discovery is what makes a run quick.
+    # 0 disables the window (every open PR, however stale).
+    "discovery_window_hours": 24,
 
     # --- GATE RULES: the editable checklist -------------------------------
     # Each rule forces a PR to MANUAL (you handle it) or SKIP (ignore it) when
@@ -233,6 +238,32 @@ class GitHub:
         return self._login
 
 
+def window_start(cfg, hours=None):
+    """
+    Start of the discovery window as an aware UTC datetime, or None when the
+    window is off. `hours` overrides the configured value.
+    """
+    if hours is None:
+        hours = cfg.get("discovery_window_hours", 24)
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        return None
+    if hours <= 0:
+        return None
+    return (datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(hours=hours))
+
+
+def _parse_gh_time(value):
+    """Parse a GitHub ISO-8601 timestamp into an aware UTC datetime."""
+    try:
+        return datetime.datetime.strptime(
+            value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
 def _next_link(link_header):
     for part in link_header.split(","):
         seg = part.split(";")
@@ -274,18 +305,25 @@ def load_config(path=None):
 # ----------------------------------------------------------------------------
 # Discovery: where candidate PRs come from
 # ----------------------------------------------------------------------------
-def discover_from_github(gh, me, include_mentions=True):
+def discover_from_github(gh, me, include_mentions=True, since=None):
     """
     PRs where you're a requested reviewer, still open.
 
     `mentions:` is much broader — it catches any PR where someone @-mentioned
     you in a comment, which is a question, not a request to approve and merge.
     Callers that act on the result should leave it out.
+
+    `since` (aware UTC datetime) restricts the search to PRs updated inside the
+    window. GitHub applies `updated:` server-side, so this cuts the work before
+    we ever spend the ~6 calls it takes to evaluate a candidate. It matches on
+    *updated*, not created: a PR opened last week and pushed to an hour ago is
+    still live and still yours to review.
     """
     found = set()
-    queries = [f"is:open is:pr review-requested:{me} archived:false"]
+    window = f" updated:>={since.strftime('%Y-%m-%dT%H:%M:%SZ')}" if since else ""
+    queries = [f"is:open is:pr review-requested:{me} archived:false{window}"]
     if include_mentions:
-        queries.append(f"is:open is:pr mentions:{me} archived:false")
+        queries.append(f"is:open is:pr mentions:{me} archived:false{window}")
     for q in queries:
         try:
             items = gh.get_paginated("/search/issues", {"q": q}, cap=100)
@@ -299,8 +337,14 @@ def discover_from_github(gh, me, include_mentions=True):
     return found
 
 
-def discover_from_slack(cfg):
-    """Scan a Slack channel's recent history for GitHub PR links."""
+def discover_from_slack(cfg, since=None):
+    """
+    Scan a Slack channel's recent history for GitHub PR links.
+
+    `since` becomes conversations.history's `oldest`, so Slack trims the page
+    for us rather than us pulling slack_scan_limit messages and discarding the
+    stale ones.
+    """
     token = os.environ.get("SLACK_TOKEN")
     channel = cfg.get("slack_channel")
     if not token:
@@ -311,9 +355,10 @@ def discover_from_slack(cfg):
         print("note: no slack_channel configured; skipping Slack feed.",
               file=sys.stderr)
         return set()
-    url = ("https://slack.com/api/conversations.history?"
-           + urllib.parse.urlencode({"channel": channel,
-                                     "limit": cfg.get("slack_scan_limit", 200)}))
+    params = {"channel": channel, "limit": cfg.get("slack_scan_limit", 200)}
+    if since:
+        params["oldest"] = f"{since.timestamp():.6f}"
+    url = "https://slack.com/api/conversations.history?" + urllib.parse.urlencode(params)
     headers = {"Authorization": f"Bearer {token}", "User-Agent": "prboard/1.0"}
     try:
         data, _ = _request(url, headers)
@@ -755,7 +800,6 @@ def _audit(cfg, line):
         return
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        import datetime
         stamp = datetime.datetime.now().isoformat(timespec="seconds")
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(f"{stamp} {line}\n")
@@ -955,6 +999,10 @@ def main(argv=None):
                     help="with --apply: also act on PRs that merely @-mention you "
                          "(off by default — a mention is a question, not a request "
                          "to merge)")
+    ap.add_argument("--since-hours", type=float, default=None, metavar="N",
+                    help="only consider PRs updated in the last N hours "
+                         "(default 24, from config discovery_window_hours; "
+                         "0 = no window). Does not apply to an explicit --pr.")
     ap.add_argument("--json", action="store_true", help="output JSON")
     ap.add_argument("--config", help="path to a config.json")
     ap.add_argument("--apply", action="store_true",
@@ -966,6 +1014,11 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
+    since = window_start(cfg, args.since_hours)
+    hours = args.since_hours if args.since_hours is not None else cfg.get(
+        "discovery_window_hours", 24)
+    window_desc = f"{hours:g}h"
+    scope_desc = f"last {window_desc}" if since else "all time"
     for problem in validate_gate_rules(gate_rules_for(cfg)):
         print(f"warning: gate_rules — {problem}", file=sys.stderr)
     gh = GitHub(os.environ.get("GITHUB_TOKEN"),
@@ -973,6 +1026,7 @@ def main(argv=None):
     me = gh.login()
 
     candidates = set()
+    used_feed = False          # the window only describes feed-driven discovery
     if args.pr:
         for u in args.pr:
             m = GITHUB_PR_URL_RE.search(u)
@@ -986,10 +1040,23 @@ def main(argv=None):
             continue
         owner, repo = rp.split("/", 1)
         try:
-            prs = gh.get_paginated(f"/repos/{owner}/{repo}/pulls",
-                                   {"state": "open"}, cap=100)
-            for p in prs:
+            # /pulls has no date filter, but sorting by recency lets us stop at
+            # the first PR past the window instead of evaluating the whole list.
+            used_feed = True
+            prs = gh.get_paginated(
+                f"/repos/{owner}/{repo}/pulls",
+                {"state": "open", "sort": "updated", "direction": "desc"},
+                cap=100)
+            skipped = 0
+            for i, p in enumerate(prs):
+                updated = _parse_gh_time(p.get("updated_at")) if since else None
+                if updated is not None and updated < since:
+                    skipped = len(prs) - i
+                    break
                 candidates.add((owner, repo, p["number"]))
+            if skipped:
+                print(f"note: {rp}: skipped {skipped} PR(s) not updated in the "
+                      f"last {window_desc}.", file=sys.stderr)
         except ApiError as e:
             print(f"warning: could not list {rp}: {e}", file=sys.stderr)
 
@@ -1000,14 +1067,23 @@ def main(argv=None):
         if args.apply and not include_mentions:
             print("note: --apply uses the review-requested feed only; pass "
                   "--include-mentions to also act on @-mentions.", file=sys.stderr)
-        candidates |= discover_from_github(gh, me, include_mentions=include_mentions)
+        used_feed = True
+        candidates |= discover_from_github(
+            gh, me, include_mentions=include_mentions, since=since)
     elif not args.no_github and not args.repo and args.pr:
         pass  # explicit PRs only
     if args.slack:
-        candidates |= discover_from_slack(cfg)
+        used_feed = True
+        candidates |= discover_from_slack(cfg, since=since)
 
+    if not used_feed:
+        scope_desc = "named PRs"
     if not candidates:
-        print("No candidate PRs found. (Try --slack, --repo owner/repo, or --pr URL.)")
+        if since:
+            print(f"No candidate PRs updated in the {scope_desc}. "
+                  "(Try --since-hours 0, --slack, --repo owner/repo, or --pr URL.)")
+        else:
+            print("No candidate PRs found. (Try --slack, --repo owner/repo, or --pr URL.)")
         return 0
 
     results = []
@@ -1030,14 +1106,15 @@ def main(argv=None):
         print(json.dumps(results, indent=2))
     elif args.apply:
         mode = "DRY-RUN" if args.dry_run else "LIVE"
-        print(f"\nPR apply for @{me}  —  {len(results)} PR(s)  [{mode}]\n")
+        print(f"\nPR apply for @{me}  —  {len(results)} PR(s)  "
+              f"({scope_desc})  [{mode}]\n")
         for r in results:
             print(f"  {r['repo']}#{r['number']}  [{VERDICT_LABEL.get(r['verdict'], r['verdict'])}]"
                   f"  ->  {r.get('action', 'no action')}")
             print(f"     {r['url']}")
     else:
         print(f"\nPR board for @{me}  —  {len(results)} PR(s)  "
-              f"(read-only, no actions taken)\n")
+              f"({scope_desc}, read-only, no actions taken)\n")
         render_table(results)
     return 0
 

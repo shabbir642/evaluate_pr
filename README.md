@@ -26,13 +26,13 @@ prboard/
     com.vmock.prwatch.plist  launchd agent
     secrets.env.example       token template
   tests/                     test_verdicts / test_actions / test_rules
-                             test_failsafe / test_trigger
+                             test_failsafe / test_trigger / test_window
 ```
 
 ## Running tests
 
 ```bash
-for t in verdicts actions rules failsafe trigger; do python3 tests/test_$t.py || break; done
+for t in verdicts actions rules failsafe trigger window; do python3 tests/test_$t.py || break; done
 ```
 
 No network or tokens needed — they run against a mocked GitHub (and, for
@@ -116,6 +116,19 @@ chmod +x prboard.py
 The read-only board shows both the `review-requested:` and `mentions:` feeds.
 `--apply` uses **review-requested only** — being @-mentioned in a thread is a
 question, not a request to merge. Pass `--include-mentions` to opt back in.
+
+Discovery is limited to PRs **updated in the last 24 hours** (`updated:`, not
+`created:` — a PR opened last week and pushed to an hour ago is still live).
+Evaluating one PR costs ~6 GitHub calls, so this is the main lever on run time
+once the feed is large. Change it with `discovery_window_hours` in config, or
+per run:
+
+```bash
+./prboard.py --since-hours 72    # widen to three days
+./prboard.py --since-hours 0     # no window at all
+```
+
+It never applies to an explicit `--pr URL`: if you name a PR, you get it.
 
 ## Notes & limitations
 

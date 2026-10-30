@@ -5,6 +5,9 @@
   "slack_scan_limit": 200,
   "default_required_approvals": 1,
 
+  "_discovery_window_hours": "Only consider PRs updated in the last N hours. Evaluating one PR costs ~6 GitHub calls, so this is the main lever on how long a run takes. 0 = no window. Override per-run with --since-hours.",
+  "discovery_window_hours": 24,
+
   "gate_rules": [
     {"name": "targets protected branch", "action": "manual",
      "when": {"base_in": ["master", "prod", "production", "main"]}},
