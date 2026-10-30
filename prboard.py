@@ -109,7 +109,18 @@ DEFAULT_CONFIG = {
     "audit_log": "~/.local/share/prboard/audit.log",
     "wait_timeout_seconds": 1800,    # how long to wait for checks to go green
     "wait_interval_seconds": 30,
+    # A commit with no checks at all is NOT green. Set true only for repos
+    # that genuinely have no CI.
+    "allow_no_checks": False,
 }
+
+# No timeout means urllib can block forever on a half-open socket, which in
+# prwatch wedges the worker thread and leaves the PR stuck in _inflight.
+HTTP_TIMEOUT = float(os.environ.get("PRBOARD_HTTP_TIMEOUT", "30"))
+
+# GitHub's /files listing is paged; past this we can't be sure we saw every
+# changed path, so the path gates can no longer be trusted.
+FILES_CAP = 400
 
 GITHUB_PR_URL_RE = re.compile(
     r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)"
@@ -142,14 +153,14 @@ class ApiError(Exception):
         self.message = message
 
 
-def _request(url, headers, method="GET", data=None):
+def _request(url, headers, method="GET", data=None, timeout=None):
     body = json.dumps(data).encode("utf-8") if data is not None else None
     hdrs = dict(headers)
     if body is not None:
         hdrs["Content-Type"] = "application/json"
     req = urllib.request.Request(url, headers=hdrs, method=method, data=body)
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or HTTP_TIMEOUT) as resp:
             raw = resp.read().decode("utf-8")
             parsed = json.loads(raw) if raw else None
             return parsed, dict(resp.headers)
@@ -162,6 +173,10 @@ def _request(url, headers, method="GET", data=None):
         raise ApiError(e.code, detail or e.reason)
     except urllib.error.URLError as e:
         raise ApiError(0, str(e.reason))
+    except (TimeoutError, OSError) as e:
+        # socket.timeout and friends can surface outside URLError; a hung
+        # request must become a normal ApiError so the gates fail closed.
+        raise ApiError(0, f"{type(e).__name__}: {e}")
 
 
 class GitHub:
@@ -236,6 +251,8 @@ def load_config(path=None):
     cfg = dict(DEFAULT_CONFIG)
     candidates = []
     if path:
+        if not os.path.isfile(path):
+            raise SystemExit(f"--config: no such file: {path}")
         candidates.append(path)
     candidates.append(
         os.path.expanduser("~/.config/prboard/config.json")
@@ -257,13 +274,18 @@ def load_config(path=None):
 # ----------------------------------------------------------------------------
 # Discovery: where candidate PRs come from
 # ----------------------------------------------------------------------------
-def discover_from_github(gh, me):
-    """PRs where you're a requested reviewer or mentioned, still open."""
+def discover_from_github(gh, me, include_mentions=True):
+    """
+    PRs where you're a requested reviewer, still open.
+
+    `mentions:` is much broader — it catches any PR where someone @-mentioned
+    you in a comment, which is a question, not a request to approve and merge.
+    Callers that act on the result should leave it out.
+    """
     found = set()
-    queries = [
-        f"is:open is:pr review-requested:{me} archived:false",
-        f"is:open is:pr mentions:{me} archived:false",
-    ]
+    queries = [f"is:open is:pr review-requested:{me} archived:false"]
+    if include_mentions:
+        queries.append(f"is:open is:pr mentions:{me} archived:false")
     for q in queries:
         try:
             items = gh.get_paginated("/search/issues", {"q": q}, cap=100)
@@ -329,23 +351,25 @@ def _latest_reviews(reviews):
 def _check_state(gh, owner, repo, sha, required_contexts):
     """
     Summarize checks for a commit. Returns (state, detail) where state is one
-    of 'passing' | 'pending' | 'failing' | 'none'.
+    of 'passing' | 'pending' | 'failing' | 'none' | 'error'.
+    'none' means the commit genuinely has no checks; 'error' means we could not
+    find out. Neither is ever treated as green by the caller.
     Considers GitHub Actions check-runs AND legacy commit statuses.
     If required_contexts is given, only those gate the state.
     """
-    runs = []
+    runs, runs_err = [], None
     try:
         cr = gh.get(f"/repos/{owner}/{repo}/commits/{sha}/check-runs")
         runs = cr.get("check_runs", []) if cr else []
-    except ApiError:
-        pass
-    statuses = {}
+    except ApiError as e:
+        runs_err = e
+    statuses, statuses_err = {}, None
     try:
         st = gh.get(f"/repos/{owner}/{repo}/commits/{sha}/status")
         for s in (st.get("statuses", []) if st else []):
             statuses[s.get("context")] = s.get("state")  # success/pending/failure/error
-    except ApiError:
-        pass
+    except ApiError as e:
+        statuses_err = e
 
     def classify(name, status, conclusion):
         if status and status != "completed":
@@ -370,6 +394,10 @@ def _check_state(gh, owner, repo, sha, required_contexts):
             results[ctx] = "failing"
 
     if not results:
+        # An endpoint we could not read might have been hiding a failing check.
+        err = runs_err or statuses_err
+        if err is not None:
+            return "error", f"could not read checks ({err})"
         return "none", "no checks reported"
 
     if required_contexts:
@@ -408,15 +436,59 @@ def _branch_protection(gh, owner, repo, base):
     return required_approvals, (contexts or None), True
 
 
+def _match_path(path, pat):
+    """
+    fnmatch has no '**' concept, so a pattern like '**/*.tf' only matches when
+    there IS a leading directory — root-level files silently escape. Try the
+    pattern as written, then with each '**/' collapsed to nothing, so '**/'
+    means "zero or more directories" the way everyone writing these expects.
+    """
+    if fnmatch(path, pat):
+        return True
+    while "**/" in pat:
+        pat = pat.replace("**/", "", 1)
+        if fnmatch(path, pat):
+            return True
+    return False
+
+
 def _sensitive_hits(files, patterns):
     hits = []
     for f in files:
         path = f.get("filename", "")
         for pat in patterns:
-            if fnmatch(path, pat):
+            if _match_path(path, pat):
                 hits.append(path)
                 break
     return hits
+
+
+KNOWN_PREDICATES = frozenset({
+    "base_in", "base_not_in", "repo_in", "repo_not_in", "files_match",
+    "changed_files_gt", "changed_lines_gt", "author_is_bot",
+    "author_association_in", "labels_any", "title_regex",
+})
+
+
+class UnknownPredicate(Exception):
+    """A gate rule referenced a predicate we don't implement."""
+
+
+def validate_gate_rules(rules):
+    """Return a list of human-readable problems with a gate_rules list."""
+    problems = []
+    for i, rule in enumerate(rules or []):
+        name = rule.get("name", f"rule #{i + 1}")
+        action = rule.get("action", "manual")
+        if action not in ("manual", "skip"):
+            problems.append(f"{name}: unknown action {action!r} (expected manual/skip)")
+        when = rule.get("when") or {}
+        if not when:
+            problems.append(f"{name}: empty 'when' — rule can never fire")
+        for key in when:
+            if key not in KNOWN_PREDICATES:
+                problems.append(f"{name}: unknown predicate {key!r}")
+    return problems
 
 
 def _predicate_match(key, val, ctx):
@@ -444,9 +516,9 @@ def _predicate_match(key, val, ctx):
         return bool(want & set(ctx["labels"]))
     if key == "title_regex":
         return re.search(val, ctx["title"] or "") is not None
-    # Unknown predicate: ignore it (don't accidentally match).
-    print(f"warning: unknown gate predicate '{key}' — ignored", file=sys.stderr)
-    return False
+    # A predicate we don't understand means this rule cannot be evaluated.
+    # Silently ignoring it would disable the gate, so fail closed instead.
+    raise UnknownPredicate(key)
 
 
 def apply_gate_rules(rules, ctx):
@@ -457,7 +529,18 @@ def apply_gate_rules(rules, ctx):
     manual, skip = [], []
     for rule in rules or []:
         when = rule.get("when", {})
-        if when and all(_predicate_match(k, v, ctx) for k, v in when.items()):
+        if not when:
+            continue
+        try:
+            fired = all(_predicate_match(k, v, ctx) for k, v in when.items())
+        except UnknownPredicate as e:
+            # Force MANUAL whatever the rule's declared action: a broken
+            # 'skip' rule would otherwise let a held PR through just as a
+            # broken 'manual' rule would let a protected branch through.
+            manual.append(f"{rule.get('name', 'rule')}: unknown predicate "
+                          f"'{e}' — rule could not be evaluated")
+            continue
+        if fired:
             reason = rule.get("name", "rule")
             # Add a little detail for the common cases.
             if "files_match" in when:
@@ -504,6 +587,7 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         "title": "",
         "base": "",
         "approvals": "",
+        "head_sha": "",
     }
     try:
         pr = gh.get(f"/repos/{owner}/{repo}/pulls/{number}")
@@ -515,6 +599,7 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     base = (pr.get("base") or {}).get("ref", "")
     out["base"] = base
     head_sha = (pr.get("head") or {}).get("sha", "")
+    out["head_sha"] = head_sha
     author = (pr.get("user") or {}).get("login", "")
     assoc = pr.get("author_association", "")
     is_draft = pr.get("draft", False)
@@ -543,11 +628,13 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         return out
 
     # --- gather review + protection + checks ------------------------------
+    gate_errors = []
     try:
         reviews = gh.get_paginated(
             f"/repos/{owner}/{repo}/pulls/{number}/reviews", cap=200)
-    except ApiError:
+    except ApiError as e:
         reviews = []
+        gate_errors.append(f"could not read reviews ({e}) — approval state unknown")
     latest = _latest_reviews(reviews)
     approvals = sum(1 for s in latest.values() if s == "APPROVED")
     changes_requested = any(s == "CHANGES_REQUESTED" for s in latest.values())
@@ -560,13 +647,20 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     out["approvals"] = f"{approvals}/{req_approvals}"
 
     check_state, check_detail = _check_state(gh, owner, repo, head_sha, req_contexts)
+    if check_state == "error":
+        gate_errors.append(check_detail)
 
     # --- gate rules (the editable checklist) -------------------------------
     try:
         files = gh.get_paginated(
-            f"/repos/{owner}/{repo}/pulls/{number}/files", cap=400)
-    except ApiError:
+            f"/repos/{owner}/{repo}/pulls/{number}/files", cap=FILES_CAP)
+    except ApiError as e:
         files = []
+        gate_errors.append(f"could not read changed files ({e}) — path gates skipped")
+    else:
+        if len(files) >= FILES_CAP:
+            gate_errors.append(
+                f"changed-file list truncated at {FILES_CAP} — path gates incomplete")
     is_bot = ((pr.get("user") or {}).get("type") == "Bot"
               or author.endswith("[bot]"))
     ctx = {
@@ -581,6 +675,8 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
         "title": out["title"],
     }
     red_flags, skip_reasons = apply_gate_rules(gate_rules_for(cfg), ctx)
+    # A gate whose input we could not load is a red flag, never a free pass.
+    red_flags = gate_errors + red_flags
 
     if skip_reasons:
         out["verdict"] = "DRAFT_OR_HOLD"
@@ -610,11 +706,14 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
     if red_flags:
         out["verdict"] = "MANUAL_REVIEW"
         reasons.extend(red_flags)
-        if check_state == "pending":
+        if check_state in ("pending", "none"):
             reasons.append(check_detail)
         return out
 
-    if check_state == "pending":
+    # 'none' means CI has not reported yet — on a fresh push that is the normal
+    # state for the first few seconds. Waiting is correct; calling it green is not.
+    if check_state == "pending" or (
+            check_state == "none" and not cfg.get("allow_no_checks", False)):
         out["verdict"] = "CHECKS_PENDING"
         reasons.append(check_detail)
         return out
@@ -632,7 +731,12 @@ def evaluate_pr(gh, cfg, owner, repo, number, me):
 
     if you_approved:
         out["verdict"] = "APPROVED_WAITING"
-        reasons.append(f"you approved; waiting on {req_approvals - approvals} more")
+        outstanding = max(0, req_approvals - approvals)
+        if outstanding:
+            reasons.append(f"you approved; waiting on {outstanding} more")
+        else:
+            reasons.append(f"you approved; {approvals}/{req_approvals} approvals "
+                           f"but state={mergeable_state}")
         return out
 
     out["verdict"] = "NEEDS_YOUR_APPROVAL"
@@ -702,9 +806,14 @@ def apply_pr(gh, cfg, owner, repo, number, me, dry_run=False):
         _audit(cfg, f"{owner}/{repo}#{number} SKIP {verdict}")
         return ev
 
-    # Pin the exact commit we're acting on.
-    pr = gh.get(f"/repos/{owner}/{repo}/pulls/{number}")
-    head_sha = (pr.get("head") or {}).get("sha", "")
+    # Pin the exact commit the gates were evaluated against — deliberately NOT
+    # a fresh read. If a push landed mid-flight, GitHub rejects the stale SHA
+    # and we fail safe, instead of acting on code no gate ever saw.
+    head_sha = ev.get("head_sha", "")
+    if not head_sha:
+        ev["action"] = "no action (head SHA unknown)"
+        _audit(cfg, f"{owner}/{repo}#{number} SKIP no-head-sha")
+        return ev
 
     # Approve if it's green, flag-free, and you haven't approved yet.
     approved_this_run = False
@@ -737,6 +846,14 @@ def apply_pr(gh, cfg, owner, repo, number, me, dry_run=False):
             ready = False
     else:
         ready = (verdict == "READY_TO_MERGE")
+
+    # The re-evaluation above may have seen a newer commit than the one we just
+    # approved. Never merge a head the approval does not cover, and say so —
+    # a branch moving under you mid-run is worth knowing about either way.
+    if ev.get("head_sha", head_sha) != head_sha:
+        actions.append(f"head moved to {ev.get('head_sha', '')[:7]} after approval;"
+                       " not merging this run")
+        ready = False
 
     # Merge only if genuinely ready AND auto-merge is explicitly enabled.
     if ready:
@@ -834,6 +951,10 @@ def main(argv=None):
                     help="also scan the configured Slack channel for PR links")
     ap.add_argument("--no-github", action="store_true",
                     help="skip the GitHub review-requested/mentions feed")
+    ap.add_argument("--include-mentions", action="store_true",
+                    help="with --apply: also act on PRs that merely @-mention you "
+                         "(off by default — a mention is a question, not a request "
+                         "to merge)")
     ap.add_argument("--json", action="store_true", help="output JSON")
     ap.add_argument("--config", help="path to a config.json")
     ap.add_argument("--apply", action="store_true",
@@ -845,6 +966,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
+    for problem in validate_gate_rules(gate_rules_for(cfg)):
+        print(f"warning: gate_rules — {problem}", file=sys.stderr)
     gh = GitHub(os.environ.get("GITHUB_TOKEN"),
                 os.environ.get("GITHUB_API_URL", "https://api.github.com"))
     me = gh.login()
@@ -871,7 +994,13 @@ def main(argv=None):
             print(f"warning: could not list {rp}: {e}", file=sys.stderr)
 
     if not args.no_github and not args.pr and not args.repo:
-        candidates |= discover_from_github(gh, me)
+        # Acting on a bare @-mention would mean merging a PR someone only asked
+        # you a question about, so --apply drops that feed unless asked.
+        include_mentions = args.include_mentions or not args.apply
+        if args.apply and not include_mentions:
+            print("note: --apply uses the review-requested feed only; pass "
+                  "--include-mentions to also act on @-mentions.", file=sys.stderr)
+        candidates |= discover_from_github(gh, me, include_mentions=include_mentions)
     elif not args.no_github and not args.repo and args.pr:
         pass  # explicit PRs only
     if args.slack:

@@ -26,15 +26,21 @@ prboard/
     com.vmock.prwatch.plist  launchd agent
     secrets.env.example       token template
   tests/                     test_verdicts / test_actions / test_rules
+                             test_failsafe / test_trigger
 ```
 
 ## Running tests
 
 ```bash
-python3 tests/test_verdicts.py && python3 tests/test_actions.py && python3 tests/test_rules.py
+for t in verdicts actions rules failsafe trigger; do python3 tests/test_$t.py || break; done
 ```
 
-No network or tokens needed — they run against a mocked GitHub.
+No network or tokens needed — they run against a mocked GitHub (and, for
+`test_trigger`, a stubbed `slack_sdk`, so no pip install either).
+
+`test_failsafe` and `test_trigger` cover the degraded paths specifically: an
+unreadable GitHub endpoint, a commit with no checks yet, a push landing between
+gating and acting, a typo'd gate rule, and who is allowed to trigger a run.
 
 ## What it does
 
@@ -107,6 +113,10 @@ chmod +x prboard.py
 ./prboard.py --slack --json  # machine-readable, for piping
 ```
 
+The read-only board shows both the `review-requested:` and `mentions:` feeds.
+`--apply` uses **review-requested only** — being @-mentioned in a thread is a
+question, not a request to merge. Pass `--include-mentions` to opt back in.
+
 ## Notes & limitations
 
 - **Branch protection** may be unreadable without admin rights on the repo. If
@@ -147,6 +157,20 @@ Safety controls (in `config.json`):
 - `enabled` — master kill switch; `false` = never act. Env `PRBOARD_DISABLE=1`
   does the same instantly.
 - `audit_log` — every approve/merge is appended here with timestamp + SHA.
+- `allow_no_checks` — **false by default.** A commit with no checks reported is
+  treated as `CHECKS_PENDING`, not green; on a fresh push CI needs a moment to
+  register. Set true only for repos that genuinely have no CI.
+
+Things that deliberately fail *closed* — each resolves to `MANUAL_REVIEW`, which
+the action engine never touches:
+
+- a GitHub endpoint the gates depend on (changed files, reviews, checks) can't be read
+- the changed-file list is truncated, so the path gates can't have seen everything
+- a gate rule names a predicate that doesn't exist (run with `--json` to see it;
+  startup also prints a warning, and `validate_gate_rules` lists every problem)
+
+Approve and merge are pinned to the SHA the gates actually ran against, so a push
+landing mid-run is rejected by GitHub rather than silently acted on.
 
 ---
 
@@ -172,10 +196,22 @@ Mac is awake and you're logged in; `launchd` keeps it alive and restarts it.
    `message.channels` (or `message.groups` for a private channel).
 5. **Invite the bot to the channel**: in #cmc-deployments-team, `/invite @YourApp`.
 
+### Who can trigger it
+
+A message only starts a run if it is from a **human** in the configured channel
+(messages carrying `bot_id`/`app_id` are ignored, so the GitHub or Jira Slack
+app posting a PR link that mentions you will not set anything off), is **not
+from you**, and **@-mentions you** with a PR link in it.
+
+Set `PRBOARD_ALLOWED_SENDERS` to a comma-separated list of Slack user ids to
+narrow that to specific people. Unset means any human in the channel.
+
 ### Run it
 
+A venv in the repo keeps the dependency somewhere launchd can reliably find it:
+
 ```bash
-pip install slack_sdk
+python3 -m venv .venv && .venv/bin/pip install slack_sdk
 mkdir -p ~/.config/prboard
 cp deploy/secrets.env.example ~/.config/prboard/secrets.env   # fill in tokens; chmod 600
 chmod 600 ~/.config/prboard/secrets.env
@@ -198,6 +234,13 @@ launchctl load ~/Library/LaunchAgents/com.vmock.prwatch.plist
 # logs: ~/Library/Logs/prwatch.out  /  .err
 # stop: launchctl unload ~/Library/LaunchAgents/com.vmock.prwatch.plist
 ```
+
+`deploy/run-prwatch.sh` picks the interpreter itself: `$PRBOARD_PYTHON` if set,
+otherwise `$PRBOARD_DIR/.venv/bin/python3`, otherwise the first `python3` on
+PATH that can actually `import slack_sdk`. If none can, it exits with
+instructions rather than letting launchd restart it every 30 seconds forever.
+(launchd's PATH is minimal, so the wrapper also puts `/opt/homebrew/bin` and
+`/usr/local/bin` back.)
 
 ## Recommended rollout
 

@@ -17,6 +17,10 @@ Env required:
 Env optional:
     PRBOARD_DRY_RUN=1    log what it WOULD do, change nothing (recommended first)
     GITHUB_API_URL       default https://api.github.com
+    PRBOARD_ALLOWED_SENDERS   comma-separated Slack user ids allowed to trigger it.
+                              Unset = any human in the channel (apps are always
+                              ignored). Set it to lock the trigger down to your team.
+    PRBOARD_HTTP_TIMEOUT      seconds per GitHub request (default 30)
 
 Start it:  ./prwatch.py       (or run under launchd — see com.vmock.prwatch.plist)
 """
@@ -45,6 +49,9 @@ CFG = pb.load_config(os.environ.get("PRBOARD_CONFIG"))
 MY_SLACK_ID = os.environ.get("PRBOARD_SLACK_USER", "")
 CHANNEL = CFG.get("slack_channel", "")
 DRY_RUN = bool(os.environ.get("PRBOARD_DRY_RUN"))
+ALLOWED_SENDERS = {u.strip() for u in
+                   os.environ.get("PRBOARD_ALLOWED_SENDERS", "").split(",")
+                   if u.strip()}
 
 _inflight = set()
 _lock = threading.Lock()
@@ -108,6 +115,21 @@ def on_event(client, req):
         return
     if event.get("channel") != CHANNEL:
         return
+    # subtype alone does not reliably exclude apps: a Slack app posting with a
+    # bot token produces a plain message event carrying bot_id/app_id. Without
+    # this, a GitHub or Jira integration posting a PR link that mentions you
+    # would approve and merge it with no human having asked.
+    if event.get("bot_id") or event.get("app_id"):
+        log(f"ignoring app-posted message (bot_id={event.get('bot_id')})")
+        return
+    sender = event.get("user")
+    if not sender:
+        return
+    if sender == MY_SLACK_ID:         # your own messages aren't a request to you
+        return
+    if ALLOWED_SENDERS and sender not in ALLOWED_SENDERS:
+        log(f"ignoring message from {sender} (not in PRBOARD_ALLOWED_SENDERS)")
+        return
     text = event.get("text", "") or ""
     # React only when YOU are mentioned (your rule: "sends PR and mentions me").
     if MY_SLACK_ID and f"<@{MY_SLACK_ID}>" not in text:
@@ -116,7 +138,7 @@ def on_event(client, req):
     for m in pb.GITHUB_PR_URL_RE.finditer(text):
         prs.add((m.group(1), m.group(2), int(m.group(3))))
     for owner, repo, number in prs:
-        log(f"trigger: {owner}/{repo}#{number} from Slack message")
+        log(f"trigger: {owner}/{repo}#{number} from Slack message by {sender}")
         threading.Thread(target=handle_pr, args=(owner, repo, number, client.web_client),
                          daemon=True).start()
 
@@ -130,6 +152,8 @@ def main():
         sys.exit("set PRBOARD_SLACK_USER to your Slack user id (e.g. U02LS4K29KQ)")
     if not CHANNEL:
         sys.exit("no slack_channel in config")
+    for problem in pb.validate_gate_rules(pb.gate_rules_for(CFG)):
+        log(f"WARNING: gate_rules — {problem}")
 
     client = SocketModeClient(
         app_token=os.environ["SLACK_APP_TOKEN"],
@@ -138,7 +162,9 @@ def main():
     client.socket_mode_request_listeners.append(on_event)
     mode = "DRY-RUN" if DRY_RUN else ("LIVE, auto-merge "
             + ("ON" if CFG.get("enable_auto_merge") else "OFF"))
-    log(f"prwatch connecting — channel {CHANNEL}, reacting to <@{MY_SLACK_ID}> [{mode}]")
+    senders = ",".join(sorted(ALLOWED_SENDERS)) if ALLOWED_SENDERS else "any human"
+    log(f"prwatch connecting — channel {CHANNEL}, reacting to <@{MY_SLACK_ID}> "
+        f"from {senders} [{mode}]")
     client.connect()
     threading.Event().wait()   # run forever
 
