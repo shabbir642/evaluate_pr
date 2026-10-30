@@ -301,6 +301,21 @@ from you**, and **@-mentions you** with a PR link in it.
 Set `PRBOARD_ALLOWED_SENDERS` to a comma-separated list of Slack user ids to
 narrow that to specific people. Unset means any human in the channel.
 
+### Check the setup first
+
+A misconfigured Socket Mode app does not error — it connects, authenticates,
+logs `prwatch connecting` and then stays silent. `deploy/preflight.py` checks
+each link separately so a failure names itself:
+
+```bash
+set -a; . ~/.config/prboard/secrets.env; set +a; .venv/bin/python3 deploy/preflight.py
+```
+
+It verifies both tokens are the right kind, that the bot authenticates, that it
+holds `groups:history` and `chat:write`, that it is actually a member of the
+channel, that Socket Mode opens, and that GitHub auth works — then prints what
+the process would do once triggered. It never prints a token.
+
 ### Run it
 
 A venv in the repo keeps the dependency somewhere launchd can reliably find it:
