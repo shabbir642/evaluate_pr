@@ -388,6 +388,69 @@ gh = FakeGH(mkpr("unstable"), checkruns=PASSING, reviews=[approve(ME)])
 pb.apply_pr(gh, cfg(enable_auto_merge=True), "o", "r", 1, ME)
 chk("unstable + all green merges on enable_auto_merge alone", len(gh.puts) == 1)
 
+# --- wait_until_actionable: the --wait / prwatch polling loop -------------
+# Untested until now, and it can block for wait_timeout_seconds in production.
+import time
+
+class PollingGH(FakeGH):
+    """Checks stay in_progress for `flips` polls, then settle."""
+
+    def __init__(self, flips=2, settle="success", **kw):
+        super().__init__(mkpr("clean"), reviews=[approve("bob")], **kw)
+        self._flips = flips; self._settle = settle; self.polls = 0
+
+    def get(self, path, params=None):
+        if path.endswith("/pulls/1"):
+            self.polls += 1
+        if "/check-runs" in path:
+            if self.polls <= self._flips:
+                return {"check_runs": [R("ci", "in_progress")]}
+            return {"check_runs": [R("ci", "completed", self._settle)]}
+        return super().get(path, params)
+
+
+FAST = dict(wait_interval_seconds=0.01, wait_timeout_seconds=5, audit_log="")
+
+gh = PollingGH(flips=2)
+ev = pb.wait_until_actionable(gh, cfg(**FAST), "o", "r", 1, ME)
+chk("waits, then returns the settled verdict", ev["verdict"] == "READY_TO_MERGE")
+chk("polled more than once", gh.polls > 1)
+
+gh = PollingGH(flips=2, settle="failure")
+ev = pb.wait_until_actionable(gh, cfg(**FAST), "o", "r", 1, ME)
+chk("a failure after waiting is reported, not merged",
+    ev["verdict"] == "CHECKS_FAILED")
+
+gh = PollingGH(flips=0)
+ev = pb.wait_until_actionable(gh, cfg(**FAST), "o", "r", 1, ME)
+chk("already actionable -> returns at once", gh.polls == 1)
+
+# never settles: must give up rather than spin forever
+SLOW = dict(wait_interval_seconds=0.01, wait_timeout_seconds=0.05, audit_log="")
+gh = PollingGH(flips=10**6)
+t0 = time.time()
+ev = pb.wait_until_actionable(gh, cfg(**SLOW), "o", "r", 1, ME)
+chk("gives up at the timeout", time.time() - t0 < 2)
+chk("timeout keeps the pending verdict", ev["verdict"] == "CHECKS_PENDING")
+chk("timeout says so in the action",
+    "timeout" in ev.get("action", ""))
+chk("a timed-out PR is not actionable",
+    ev["verdict"] not in pb.actionable_verdicts(cfg()))
+
+# a terminal non-actionable verdict must not be polled for 30 minutes
+class ConflictGH(FakeGH):
+    def __init__(self):
+        super().__init__(mkpr("dirty", mergeable=False), checkruns=PASSING)
+        self.polls = 0
+    def get(self, path, params=None):
+        if path.endswith("/pulls/1"): self.polls += 1
+        return super().get(path, params)
+
+
+gh = ConflictGH()
+ev = pb.wait_until_actionable(gh, cfg(**FAST), "o", "r", 1, ME)
+chk("a conflict returns immediately", ev["verdict"] == "CONFLICT" and gh.polls == 1)
+
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")
 sys.exit(0 if ok == len(res) else 1)
