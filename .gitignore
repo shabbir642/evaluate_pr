@@ -15,3 +15,6 @@ audit.log
 
 # local venv for prwatch's slack_sdk
 .venv/
+
+# local product doc — not for a public repo
+PRD.md
