@@ -24,11 +24,18 @@ Env optional:
                               Unset = any human in the channel (apps are always
                               ignored). Set it to lock the trigger down to your team.
     PRBOARD_HTTP_TIMEOUT      seconds per GitHub request (default 30)
+    PRBOARD_NOTIFY=0          turn macOS notifications off (default on)
+    PRBOARD_NOTIFIER          auto (default) | terminal-notifier | osascript | off.
+                              terminal-notifier makes the banner clickable
+                              (opens the PR); osascript is built in but posts
+                              as "Script Editor" and cannot be clicked.
 
 Start it:  ./prwatch.py       (or run under launchd — see com.vmock.prwatch.plist)
 """
 
 import os
+import shutil
+import subprocess
 import sys
 import threading
 import importlib.util
@@ -79,6 +86,68 @@ def log(msg):
     print(f"{datetime.datetime.now().isoformat(timespec='seconds')} {msg}", flush=True)
 
 
+NOTIFY_TIMEOUT = 10
+
+
+def _notifier():
+    """Which backend to post macOS notifications with, or None for off."""
+    choice = os.environ.get("PRBOARD_NOTIFIER", "auto").strip().lower()
+    if not env_flag("PRBOARD_NOTIFY", default=True) or choice in ("off", "none"):
+        return None
+    if choice == "osascript":
+        return "osascript" if shutil.which("osascript") else None
+    if choice in ("terminal-notifier", "terminal_notifier"):
+        return "terminal-notifier" if shutil.which("terminal-notifier") else None
+    # auto: prefer terminal-notifier, which can open the PR on click.
+    if shutil.which("terminal-notifier"):
+        return "terminal-notifier"
+    return "osascript" if shutil.which("osascript") else None
+
+
+def _notify_command(backend, title, subtitle, text, url=""):
+    """
+    Build the argv for one notification.
+
+    Nothing from GitHub is ever interpolated into a script body. PR titles
+    contain quotes, backslashes and apostrophes; pasting them into AppleScript
+    source would both break and hand a PR author a way to run AppleScript on
+    this machine. osascript takes them through `argv` instead, so they stay
+    data.
+    """
+    if backend == "terminal-notifier":
+        argv = ["terminal-notifier", "-title", title, "-subtitle", subtitle,
+                "-message", text, "-group", f"prboard-{title}"]
+        if url:
+            argv += ["-open", url]
+        return argv
+    return [
+        "osascript",
+        "-e", "on run argv",
+        "-e", "display notification (item 1 of argv) "
+              "with title (item 2 of argv) subtitle (item 3 of argv)",
+        "-e", "end run",
+        "--", text, title, subtitle,
+    ]
+
+
+def _notify_mac(title, subtitle, text, url=""):
+    """
+    Best-effort macOS banner. Never raises, never blocks for long.
+
+    This runs after an approve or merge has already happened, so a notification
+    problem must not surface as a failure of the action it is reporting.
+    """
+    backend = _notifier()
+    if backend is None:
+        return
+    try:
+        subprocess.run(_notify_command(backend, title, subtitle, text, url),
+                       timeout=NOTIFY_TIMEOUT, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        log(f"mac notification failed ({backend}): {e}")
+
+
 def _notify(web, text):
     """Best-effort DM to yourself so you see what happened."""
     if not MY_SLACK_ID:
@@ -114,6 +183,12 @@ def handle_pr(owner, repo, number, web):
             mode = " [DRY-RUN]" if DRY_RUN else ""
             _notify(web, f"{owner}/{repo}#{number} [{label}]{mode}\n"
                          f"{action}\n{ev['url']}")
+            # Same condition as the Slack DM, so there is one definition of
+            # "worth telling you" rather than two that drift apart.
+            _notify_mac(title=f"{owner}/{repo}#{number}",
+                        subtitle=f"{label}{mode}",
+                        text=action,
+                        url=ev.get("url", ""))
     except Exception as e:
         log(f"{owner}/{repo}#{number} ERROR: {e}")
     finally:

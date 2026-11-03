@@ -27,13 +27,13 @@ prboard/
     secrets.env.example       token template
   tests/                     test_verdicts / test_actions / test_rules
                              test_failsafe / test_trigger / test_window
-                             test_progress / test_mergeability
+                             test_progress / test_mergeability / test_notify
 ```
 
 ## Running tests
 
 ```bash
-for t in verdicts actions rules failsafe trigger window progress mergeability; do python3 tests/test_$t.py || break; done
+for t in verdicts actions rules failsafe trigger window progress mergeability notify; do python3 tests/test_$t.py || break; done
 ```
 
 No network or tokens needed — they run against a mocked GitHub (and, for
@@ -290,6 +290,27 @@ Mac is awake and you're logged in; `launchd` keeps it alive and restarts it.
 > `channels:*` equivalents are for public channels and would leave the bot
 > connected but never triggered. For a public channel use `channels:history`
 > and `message.channels` instead.
+
+### macOS notifications
+
+Each result that is worth your attention also posts a desktop banner — the same
+condition that sends the Slack DM, so the two never drift.
+
+It uses `terminal-notifier` when that is on `PATH`, which makes the banner
+clickable (it opens the PR), and falls back to the built-in `osascript`
+otherwise. No install is required; `brew install terminal-notifier` just
+improves it.
+
+```bash
+PRBOARD_NOTIFY=0           # off
+PRBOARD_NOTIFIER=osascript # force a backend: auto | terminal-notifier | osascript | off
+```
+
+Notifications are best-effort: they fire after an approve or merge has already
+happened, so a failure is logged and ignored rather than reported as a failure
+of the action. macOS asks permission the first time and shows nothing until it
+is granted, Focus/Do Not Disturb suppresses banners, and it only works while
+you are logged into the GUI session.
 
 ### Who can trigger it
 
