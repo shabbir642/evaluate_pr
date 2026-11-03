@@ -113,8 +113,10 @@ chk("subtype is still ignored",
                       "text": f"<@{ME_SLACK}> {LINK}"}))
 chk("message with no sender is ignored",
     not triggers(pw, {"text": f"<@{ME_SLACK}> {LINK}"}))
-chk("your own message does not trigger you",
-    not triggers(pw, {"user": ME_SLACK, "text": f"<@{ME_SLACK}> {LINK}"}))
+# Changed deliberately: self-posts are now the request (see the self-posting
+# section below), so a link from you fires with or without a self-mention.
+chk("your own message with a self-mention triggers",
+    triggers(pw, {"user": ME_SLACK, "text": f"<@{ME_SLACK}> {LINK}"}))
 chk("no mention -> no trigger",
     not triggers(pw, {"user": "U_T", "text": f"anyone free for {LINK}?"}))
 chk("mention without a PR link -> no trigger",
@@ -168,6 +170,31 @@ pw.pb = type("P", (), {
 })()
 pw.handle_pr("o", "r", 1, None)
 chk("dry run reaches apply_pr with dry_run=True", seen.get("dry_run") is True)
+
+# --- you can queue a PR yourself --------------------------------------------
+# The channel exists for review and merge, so a link YOU post is the request
+# and needs no self-mention. Everyone else still has to mention you.
+pw = load_prwatch(PRBOARD_SLACK_USER=ME_SLACK)
+chk("you post a link, no mention -> fires",
+    triggers(pw, {"user": ME_SLACK, "text": LINK}))
+chk("you post mentioning a colleague -> fires",
+    triggers(pw, {"user": ME_SLACK, "text": f"<@U_OTHER> {LINK}"}))
+chk("you post with no PR link -> ignored",
+    not triggers(pw, {"user": ME_SLACK, "text": "lunch?"}))
+chk("colleague without a mention -> still ignored",
+    not triggers(pw, {"user": "U_T", "text": LINK}))
+chk("colleague with a mention -> fires",
+    triggers(pw, {"user": "U_T", "text": f"<@{ME_SLACK}> {LINK}"}))
+chk("an app posting as you -> still ignored",
+    not triggers(pw, {"user": ME_SLACK, "bot_id": "B1", "text": LINK}))
+
+# the allowlist is about other people; it must not lock you out of your own channel
+pw = load_prwatch(PRBOARD_SLACK_USER=ME_SLACK, PRBOARD_ALLOWED_SENDERS="U_OK")
+chk("allowlist does not exclude you", triggers(pw, {"user": ME_SLACK, "text": LINK}))
+chk("allowlist still excludes others",
+    not triggers(pw, {"user": "U_STRANGER", "text": f"<@{ME_SLACK}> {LINK}"}))
+chk("allowlisted colleague still needs the mention",
+    not triggers(pw, {"user": "U_OK", "text": LINK}))
 
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")

@@ -314,13 +314,21 @@ you are logged into the GUI session.
 
 ### Who can trigger it
 
-A message only starts a run if it is from a **human** in the configured channel
-(messages carrying `bot_id`/`app_id` are ignored, so the GitHub or Jira Slack
-app posting a PR link that mentions you will not set anything off), is **not
-from you**, and **@-mentions you** with a PR link in it.
+A message starts a run when it is from a **human** (messages carrying
+`bot_id`/`app_id` are ignored, so the GitHub or Jira Slack app posting a PR link
+will not set anything off) in the configured channel, and contains a PR link,
+and either:
+
+- **you posted it** — no mention needed. The channel is for review and merge, so
+  a link you drop there *is* the request, and you can queue one from your phone.
+- **someone else posted it** and **@-mentioned you**, anywhere in the text.
 
 Set `PRBOARD_ALLOWED_SENDERS` to a comma-separated list of Slack user ids to
-narrow that to specific people. Unset means any human in the channel.
+narrow who else can trigger it. It never excludes you. Unset means any human in
+the channel.
+
+Edits are still ignored: a message edited to add the mention or the link does
+not fire. Post a new message instead.
 
 ### Check the setup first
 

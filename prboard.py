@@ -827,6 +827,13 @@ def apply_gate_rules(rules, ctx):
                 if hits:
                     reason += ": " + ", ".join(hits[:3]) + (
                         f" (+{len(hits)-3})" if len(hits) > 3 else "")
+            # "large diff (files)" says nothing about how large. Show the
+            # figures so the board, --json and the notification all explain
+            # themselves without a second lookup.
+            if "changed_files_gt" in when:
+                reason += f": {ctx['changed_files']} files > {when['changed_files_gt']}"
+            if "changed_lines_gt" in when:
+                reason += f": {ctx['changed_lines']} lines > {when['changed_lines_gt']}"
             if rule.get("action") == "skip":
                 skip.append(reason)
             else:

@@ -87,6 +87,23 @@ def log(msg):
 
 
 NOTIFY_TIMEOUT = 10
+NOTIFY_MAX_CHARS = 160
+
+
+def _summary(ev, action):
+    """
+    One line for the banner: what it did, or — when it did nothing — why.
+
+    "no action (MANUAL_REVIEW)" tells you a decision was made but not which,
+    which is the least useful thing a notification can say.
+    """
+    if action and not action.startswith("no action"):
+        return action
+    reasons = [r for r in (ev.get("reasons") or []) if r]
+    body = " · ".join(reasons[:2])
+    if len(body) > NOTIFY_MAX_CHARS:
+        body = body[:NOTIFY_MAX_CHARS - 1].rstrip() + "…"
+    return body or action or "no action"
 
 
 def _notifier():
@@ -177,20 +194,28 @@ def handle_pr(owner, repo, number, web):
         label = pb.VERDICT_LABEL.get(ev["verdict"], ev["verdict"])
         log(f"{owner}/{repo}#{number} [{label}] -> {action}")
         # Only ping you when something meaningful happened or needs you.
-        if any(w in action for w in ("APPROVED", "MERGED", "failed", "would")) \
+        # "timeout" matters: a --wait that gives up after wait_timeout_seconds
+        # drops the PR, and without this you would never learn it had.
+        if any(w in action for w in ("APPROVED", "MERGED", "failed", "would",
+                                     "timeout")) \
                 or ev["verdict"] in ("MANUAL_REVIEW", "CONFLICT", "CHECKS_FAILED",
-                                     "CHANGES_REQUESTED", "CHECKS_ADVISORY"):
+                                     "CHANGES_REQUESTED", "CHECKS_ADVISORY",
+                                     "ERROR"):
             mode = " [DRY-RUN]" if DRY_RUN else ""
+            summary = _summary(ev, action)
             _notify(web, f"{owner}/{repo}#{number} [{label}]{mode}\n"
-                         f"{action}\n{ev['url']}")
+                         f"{summary}\n{ev['url']}")
             # Same condition as the Slack DM, so there is one definition of
             # "worth telling you" rather than two that drift apart.
             _notify_mac(title=f"{owner}/{repo}#{number}",
                         subtitle=f"{label}{mode}",
-                        text=action,
+                        text=summary,
                         url=ev.get("url", ""))
     except Exception as e:
         log(f"{owner}/{repo}#{number} ERROR: {e}")
+        _notify_mac(title=f"{owner}/{repo}#{number}", subtitle="ERROR",
+                    text=str(e)[:NOTIFY_MAX_CHARS],
+                    url=f"https://github.com/{owner}/{repo}/pull/{number}")
     finally:
         with _lock:
             _inflight.discard(key)
@@ -217,20 +242,23 @@ def on_event(client, req):
     sender = event.get("user")
     if not sender:
         return
-    if sender == MY_SLACK_ID:         # your own messages aren't a request to you
-        return
-    if ALLOWED_SENDERS and sender not in ALLOWED_SENDERS:
+    # This channel exists for review and merge; discussion happens elsewhere.
+    # So a PR link YOU post here is itself the request, and needs no mention —
+    # otherwise you could only queue a PR from your laptop, never your phone.
+    # Everyone else still has to mention you.
+    self_posted = sender == MY_SLACK_ID
+    if ALLOWED_SENDERS and not self_posted and sender not in ALLOWED_SENDERS:
         log(f"ignoring message from {sender} (not in PRBOARD_ALLOWED_SENDERS)")
         return
     text = event.get("text", "") or ""
-    # React only when YOU are mentioned (your rule: "sends PR and mentions me").
-    if MY_SLACK_ID and f"<@{MY_SLACK_ID}>" not in text:
+    if not self_posted and MY_SLACK_ID and f"<@{MY_SLACK_ID}>" not in text:
         return
     prs = set()
     for m in pb.GITHUB_PR_URL_RE.finditer(text):
         prs.add((m.group(1), m.group(2), int(m.group(3))))
     for owner, repo, number in prs:
-        log(f"trigger: {owner}/{repo}#{number} from Slack message by {sender}")
+        log(f"trigger: {owner}/{repo}#{number} from Slack message by {sender}"
+            + (" (self-posted)" if self_posted else ""))
         threading.Thread(target=handle_pr, args=(owner, repo, number, client.web_client),
                          daemon=True).start()
 

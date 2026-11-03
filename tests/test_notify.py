@@ -146,6 +146,35 @@ chk("enabled -> subprocess invoked", seen.get("argv", [None])[0] == "osascript")
 chk("invoked with a timeout", seen.get("kw", {}).get("timeout") == pw.NOTIFY_TIMEOUT)
 chk("invoked without check=True", seen.get("kw", {}).get("check") is False)
 
+# --- the banner must say WHY, not just that nothing happened ---------------
+pw = load_prwatch()
+
+ev = {"verdict": "MANUAL_REVIEW", "reasons": [
+    "large diff (files): 43 files > 40",
+    "large diff (lines): 1484 lines > 800",
+    "2 check(s) pending"]}
+body = pw._summary(ev, "no action (MANUAL_REVIEW)")
+chk("no-action banner names the gates", "43 files > 40" in body and "1484 lines" in body)
+chk("no-action banner drops the bare verdict", "no action" not in body)
+chk("only the first two reasons are shown", "2 check(s) pending" not in body)
+
+chk("an acted banner keeps the action text",
+    pw._summary({"reasons": ["x"]}, "APPROVED @ 2b16a43; MERGED (squash)")
+    == "APPROVED @ 2b16a43; MERGED (squash)")
+chk("a timeout keeps its own wording",
+    pw._summary({"reasons": ["2 pending"]}, "timeout waiting for checks to finish")
+    == "timeout waiting for checks to finish")
+
+long = [("x" * 200), ("y" * 200)]
+body = pw._summary({"reasons": long}, "no action")
+chk("long reasons are truncated", len(body) <= pw.NOTIFY_MAX_CHARS)
+chk("truncation is marked", body.endswith("…"))
+
+chk("no reasons at all falls back to the action",
+    pw._summary({"reasons": []}, "no action (SKIP_OWN_PR)") == "no action (SKIP_OWN_PR)")
+chk("missing reasons key does not crash",
+    pw._summary({}, "no action") == "no action")
+
 ok = sum(res)
 print(f"\n{ok}/{len(res)} passed")
 sys.exit(0 if ok == len(res) else 1)
