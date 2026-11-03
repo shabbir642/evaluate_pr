@@ -370,14 +370,29 @@ prwatch connecting — channel C043639SVEY, reacting to <@U02LS4K29KQ> from any 
 
 ### Keep it running (launchd)
 
-Edit the paths in `deploy/com.vmock.prwatch.plist`, then:
+```bash
+python3 deploy/install-launchd.py
+```
+
+It runs the preflight first and **refuses to install if it fails** — with
+`KeepAlive` and `ThrottleInterval 30`, a broken agent restarts every 30 seconds
+forever, which reads as "running" from the outside. Pass `--force` to override.
+
+It fills in the plist's three `/Users/USERNAME` placeholders from where the repo
+actually is, so there is nothing to hand-edit. `--channel C0XXXXXXX` sets
+`PRBOARD_SLACK_CHANNEL` for the agent; without it the agent uses `slack_channel`
+from your config.
 
 ```bash
-cp deploy/com.vmock.prwatch.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.vmock.prwatch.plist
-# logs: ~/Library/Logs/prwatch.out  /  .err
-# stop: launchctl unload ~/Library/LaunchAgents/com.vmock.prwatch.plist
+python3 deploy/install-launchd.py --status      # loaded? pid? last exit code?
+python3 deploy/install-launchd.py --uninstall   # stop and remove
 ```
+
+Logs go to `~/Library/Logs/prwatch.out` and `.err`. Check `.err` first if the
+agent seems to be running but nothing happens — a restart loop lands there.
+
+The agent only runs while you are logged in and the Mac is awake; it is a
+LaunchAgent, not a daemon.
 
 `deploy/run-prwatch.sh` picks the interpreter itself: `$PRBOARD_PYTHON` if set,
 otherwise `$PRBOARD_DIR/.venv/bin/python3`, otherwise the first `python3` on
